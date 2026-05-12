@@ -451,6 +451,7 @@ window.FinancePage = {
         this._clickHandler = async (e) => {
             const btn = e.target.closest('[data-action]');
             if (!btn) return;
+            e.preventDefault();
 
             const action = btn.dataset.action;
             switch (action) {
@@ -897,12 +898,27 @@ window.FinancePage = {
                     const item = this.adLogs[idx];
                     if (!item) continue;
 
+                    const getDetailsText = (entry) => {
+                        const d = entry.data || {};
+                        const money = Math.abs(d.money || d.cost || d.amount || d.value || 0);
+                        const qty = d.quantity || d.items || 0;
+                        const itemName = d.item_name || (typeof d.item === 'string' ? d.item : (d.item ? `物品[${d.item}]` : ''));
+                        
+                        let parts = [];
+                        if (money) parts.push(`${Utils.formatMoney(money)}`);
+                        if (itemName && qty) parts.push(`${itemName} x${qty}`);
+                        else if (itemName) parts.push(`${itemName}`);
+                        else if (qty) parts.push(`${qty}件物品`);
+                        
+                        return parts.length ? ` (${parts.join(', ')})` : '';
+                    };
+
                     const entry = item.entry;
-                    const amount = entry.data?.money || entry.data?.amount || 0;
+                    const amount = entry.data?.money || entry.data?.amount || entry.data?.cost || entry.data?.value || 0;
                     const absAmount = Math.abs(amount);
                     
                     let cat = 'other';
-                    let note = entry.title || '自动检测';
+                    let note = (entry.title || '自动检测') + getDetailsText(entry);
                     
                     if (absAmount > 0 && absAmount === Number(this.config.weekly_tax_amount)) {
                         cat = 'tax';
@@ -963,7 +979,7 @@ window.FinancePage = {
             const d = entry.data || {};
             const money = Math.abs(d.money || d.cost || d.amount || d.value || 0);
             const qty = d.quantity || d.items || 0;
-            const itemName = d.item_name || (typeof d.item === 'string' ? d.item : '');
+            const itemName = d.item_name || (typeof d.item === 'string' ? d.item : (d.item ? `物品[${d.item}]` : ''));
             
             let parts = [];
             if (money) parts.push(`${Utils.formatMoney(money)}`);
