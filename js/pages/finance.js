@@ -780,6 +780,59 @@ window.FinancePage = {
         `;
     },
 
+    // Parse item descriptions from Torn API log data (handles all formats)
+    _parseItemsFromData(d) {
+        const results = [];
+
+        // Helper to extract name from a single item entry
+        const extractName = (obj) => {
+            if (typeof obj === 'string') return obj;
+            if (typeof obj === 'number') return `物品#${obj}`;
+            if (obj && typeof obj === 'object') {
+                return obj.name || obj.item_name || obj.title || (obj.id ? `物品#${obj.id}` : null);
+            }
+            return null;
+        };
+
+        const extractQty = (obj) => {
+            if (obj && typeof obj === 'object') {
+                return obj.quantity || obj.amount || obj.qty || 0;
+            }
+            return 0;
+        };
+
+        // Case 1: d.item exists
+        if (d.item != null) {
+            const name = d.item_name || extractName(d.item);
+            const qty = (typeof d.quantity === 'number' ? d.quantity : 0) || extractQty(d.item) || 1;
+            if (name) {
+                results.push(qty > 1 ? `${name} x${qty}` : name);
+            }
+        }
+
+        // Case 2: d.items exists (could be array, object, or number)
+        if (d.items != null && typeof d.items !== 'number') {
+            const itemsArr = Array.isArray(d.items) ? d.items : Object.values(d.items);
+            for (const it of itemsArr) {
+                const name = extractName(it);
+                const qty = extractQty(it) || 1;
+                if (name) {
+                    results.push(qty > 1 ? `${name} x${qty}` : name);
+                }
+            }
+        } else if (typeof d.items === 'number' && d.items > 0 && results.length === 0) {
+            results.push(`${d.items}件物品`);
+        }
+
+        // Case 3: only d.quantity + d.name (no item/items)
+        if (results.length === 0 && d.name) {
+            const qty = typeof d.quantity === 'number' ? d.quantity : 1;
+            results.push(qty > 1 ? `${d.name} x${qty}` : d.name);
+        }
+
+        return results;
+    },
+
     async _autoDetect() {
         Utils.showLoading('获取员工往来日志...');
         try {
@@ -901,27 +954,12 @@ window.FinancePage = {
                     const getDetailsText = (entry) => {
                         const d = entry.data || {};
                         const money = Math.abs(d.money || d.cost || d.amount || d.value || 0);
-                        let qty = d.quantity || d.items || 0;
-                        let itemName = '';
-                        
-                        // Extract item name from various API formats
-                        if (d.item_name) {
-                            itemName = d.item_name;
-                        } else if (typeof d.item === 'string') {
-                            itemName = d.item;
-                        } else if (typeof d.item === 'number') {
-                            itemName = `物品#${d.item}`;
-                        } else if (d.item && typeof d.item === 'object') {
-                            itemName = d.item.name || d.item.item_name || d.item.title || `物品#${d.item.id || d.item.ID || '未知'}`;
-                            if (!qty && (d.item.quantity || d.item.amount)) qty = d.item.quantity || d.item.amount;
-                        }
-                        if (!itemName && d.name) itemName = d.name;
-                        
                         let parts = [];
                         if (money) parts.push(`${Utils.formatMoney(money)}`);
-                        if (itemName && qty) parts.push(`${itemName} x${qty}`);
-                        else if (itemName) parts.push(`${itemName}`);
-                        else if (qty) parts.push(`${qty}件物品`);
+                        
+                        // Parse items from all possible API formats
+                        const itemDescriptions = this._parseItemsFromData(d);
+                        parts.push(...itemDescriptions);
                         
                         return parts.length ? ` (${parts.join(', ')})` : '';
                     };
@@ -991,27 +1029,12 @@ window.FinancePage = {
         const getDetails = (entry) => {
             const d = entry.data || {};
             const money = Math.abs(d.money || d.cost || d.amount || d.value || 0);
-            let qty = d.quantity || d.items || 0;
-            let itemName = '';
-            
-            // Extract item name from various API formats
-            if (d.item_name) {
-                itemName = d.item_name;
-            } else if (typeof d.item === 'string') {
-                itemName = d.item;
-            } else if (typeof d.item === 'number') {
-                itemName = `物品#${d.item}`;
-            } else if (d.item && typeof d.item === 'object') {
-                itemName = d.item.name || d.item.item_name || d.item.title || `物品#${d.item.id || d.item.ID || '未知'}`;
-                if (!qty && (d.item.quantity || d.item.amount)) qty = d.item.quantity || d.item.amount;
-            }
-            if (!itemName && d.name) itemName = d.name;
-            
             let parts = [];
             if (money) parts.push(`${Utils.formatMoney(money)}`);
-            if (itemName && qty) parts.push(`${itemName} x${qty}`);
-            else if (itemName) parts.push(`${itemName}`);
-            else if (qty) parts.push(`${qty}件物品`);
+            
+            // Parse items from all possible API formats
+            const itemDescriptions = this._parseItemsFromData(d);
+            parts.push(...itemDescriptions);
             
             return parts.length ? `<span class="text-torn-green ml-2 font-mono font-bold">${parts.join(', ')}</span>` : '';
         };
