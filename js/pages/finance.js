@@ -782,19 +782,27 @@ window.FinancePage = {
     },
 
     // Parse item descriptions from Torn API log data
-    // Actual API format: data.item = [{id: 256, uid: null, qty: 100}]
+    // API formats:
+    //   "Item receive/send" (log 4103): data.items = [{id, uid, qty}]
+    //   "Faction loan item" (log 6745/6746): data.item = [{id, uid, qty}]
+    //   "Item use" (log 2290): data.item = 206 (number)
     _parseItemsFromData(d) {
         const results = [];
         const cache = this.itemNameCache || {};
 
-        // data.item is an array of {id, uid, qty}
-        if (Array.isArray(d.item)) {
-            for (const it of d.item) {
-                const name = cache[it.id] || `物品#${it.id}`;
-                const qty = it.qty || it.quantity || 1;
-                results.push(qty > 1 ? `${name} x${qty}` : name);
-            }
-        } else if (typeof d.item === 'number') {
+        // Collect item entries from both data.item and data.items
+        const itemEntries = [];
+        if (Array.isArray(d.item)) itemEntries.push(...d.item);
+        if (Array.isArray(d.items)) itemEntries.push(...d.items);
+
+        for (const it of itemEntries) {
+            const name = cache[it.id] || `物品#${it.id}`;
+            const qty = it.qty || it.quantity || 1;
+            results.push(qty > 1 ? `${name} x${qty}` : name);
+        }
+
+        // Single item as number (e.g. "Item use xanax": data.item = 206)
+        if (typeof d.item === 'number') {
             const name = cache[d.item] || `物品#${d.item}`;
             const qty = d.quantity || 1;
             results.push(qty > 1 ? `${name} x${qty}` : name);
