@@ -901,8 +901,21 @@ window.FinancePage = {
                     const getDetailsText = (entry) => {
                         const d = entry.data || {};
                         const money = Math.abs(d.money || d.cost || d.amount || d.value || 0);
-                        const qty = d.quantity || d.items || 0;
-                        const itemName = d.item_name || (typeof d.item === 'string' ? d.item : (d.item ? `物品[${d.item}]` : ''));
+                        let qty = d.quantity || d.items || 0;
+                        let itemName = '';
+                        
+                        // Extract item name from various API formats
+                        if (d.item_name) {
+                            itemName = d.item_name;
+                        } else if (typeof d.item === 'string') {
+                            itemName = d.item;
+                        } else if (typeof d.item === 'number') {
+                            itemName = `物品#${d.item}`;
+                        } else if (d.item && typeof d.item === 'object') {
+                            itemName = d.item.name || d.item.item_name || d.item.title || `物品#${d.item.id || d.item.ID || '未知'}`;
+                            if (!qty && (d.item.quantity || d.item.amount)) qty = d.item.quantity || d.item.amount;
+                        }
+                        if (!itemName && d.name) itemName = d.name;
                         
                         let parts = [];
                         if (money) parts.push(`${Utils.formatMoney(money)}`);
@@ -978,8 +991,21 @@ window.FinancePage = {
         const getDetails = (entry) => {
             const d = entry.data || {};
             const money = Math.abs(d.money || d.cost || d.amount || d.value || 0);
-            const qty = d.quantity || d.items || 0;
-            const itemName = d.item_name || (typeof d.item === 'string' ? d.item : (d.item ? `物品[${d.item}]` : ''));
+            let qty = d.quantity || d.items || 0;
+            let itemName = '';
+            
+            // Extract item name from various API formats
+            if (d.item_name) {
+                itemName = d.item_name;
+            } else if (typeof d.item === 'string') {
+                itemName = d.item;
+            } else if (typeof d.item === 'number') {
+                itemName = `物品#${d.item}`;
+            } else if (d.item && typeof d.item === 'object') {
+                itemName = d.item.name || d.item.item_name || d.item.title || `物品#${d.item.id || d.item.ID || '未知'}`;
+                if (!qty && (d.item.quantity || d.item.amount)) qty = d.item.quantity || d.item.amount;
+            }
+            if (!itemName && d.name) itemName = d.name;
             
             let parts = [];
             if (money) parts.push(`${Utils.formatMoney(money)}`);
