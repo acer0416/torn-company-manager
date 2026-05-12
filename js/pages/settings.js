@@ -164,9 +164,11 @@ window.SettingsPage = {
                         <span class="text-gray-400">版本</span>
                         <span class="badge badge-green">v1.0.0</span>
                     </div>
-                    <div class="flex justify-between">
+                    <div class="flex justify-between items-center">
                         <span class="text-gray-400">作者</span>
-                        <span class="text-white">Built for Torn City company directors</span>
+                        <span class="text-white">
+                            <a href="https://www.torn.com/profiles.php?XID=3434492" target="_blank" class="text-torn-blue hover:text-white hover:underline transition-colors">Luvsusan [3434492]</a>
+                        </span>
                     </div>
                     <div class="border-t border-torn-border pt-3 mt-3">
                         <div class="text-gray-500 text-xs text-center">
