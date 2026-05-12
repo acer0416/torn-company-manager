@@ -293,22 +293,23 @@ window.FinancePage = {
 
         const sortedTx = [...filteredTx].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
-        const catMap = {
-            train: { cls: 'badge-green', label: '训练' },
-            tax:   { cls: 'badge-blue',  label: '税务' },
-            boost: { cls: 'badge-purple', label: '加成' },
-            other: { cls: 'badge-gray',  label: '其他' }
-        };
-
         const rows = sortedTx.map(tx => {
-            const cat = catMap[tx.category] || catMap.other;
+            const cat = tx.category || 'other';
+            const catSelect = `
+                <select class="input input-xs bg-torn-surface border border-torn-border cursor-pointer tx-cat-select max-w-[80px]" data-tx-id="${tx.id}">
+                    <option value="train" ${cat === 'train' ? 'selected' : ''}>训练</option>
+                    <option value="tax" ${cat === 'tax' ? 'selected' : ''}>税务</option>
+                    <option value="boost" ${cat === 'boost' ? 'selected' : ''}>加成</option>
+                    <option value="other" ${cat === 'other' ? 'selected' : ''}>其他</option>
+                </select>
+            `;
             return {
                 select: `<input type="checkbox" class="tx-row-cb cursor-pointer" data-tx-id="${tx.id}" />`,
                 id: tx.id,
                 date: tx.date || '-',
                 employee: tx.player_name || '-',
                 amount: Utils.formatMoney(tx.amount || 0),
-                category: `<span class="badge ${cat.cls}">${cat.label}</span>`,
+                category: catSelect,
                 note: tx.note || '-',
                 actions: `
                     <div class="flex gap-1">
@@ -441,6 +442,14 @@ window.FinancePage = {
             } else if (e.target.id === 'modal-ad-select-all') {
                 const checkboxes = document.querySelectorAll('.log-entry-cb');
                 checkboxes.forEach(cb => cb.checked = e.target.checked);
+            } else if (e.target.classList.contains('tx-cat-select')) {
+                const txId = Number(e.target.dataset.txId);
+                const tx = this.transactions.find(t => t.id === txId);
+                if (tx) {
+                    tx.category = e.target.value;
+                    await DB.put('transactions', tx);
+                    Utils.toast('分类已更新', 'success');
+                }
             }
         };
         c.addEventListener('change', this._changeHandler);
@@ -655,6 +664,9 @@ window.FinancePage = {
                     ${this._splitPartHTML(1)}
                     ${this._splitPartHTML(2)}
                 </div>
+                <div class="text-sm font-bold text-torn-accent mb-4" id="split-remainder">
+                    剩余待分配金额: $${Utils.formatMoney(tx.amount)}
+                </div>
                 <button class="btn btn-xs btn-secondary mb-4" data-action="add-split-part">+ 添加部分</button>
                 <div class="flex justify-end gap-2">
                     <button class="btn btn-secondary" id="modal-split-cancel">取消</button>
@@ -674,6 +686,20 @@ window.FinancePage = {
             if (!parts) return;
             const count = parts.querySelectorAll('.split-amount').length + 1;
             parts.insertAdjacentHTML('beforeend', this._splitPartHTML(count));
+        });
+
+        // Add input listener for remainder calculation
+        document.getElementById('split-parts')?.addEventListener('input', (e) => {
+            if (e.target.classList.contains('split-amount')) {
+                const amounts = [...document.querySelectorAll('.split-amount')].map(el => Utils.parseMoneyInput(el.value));
+                const total = amounts.reduce((s, a) => s + a, 0);
+                const remainder = tx.amount - total;
+                const remEl = document.getElementById('split-remainder');
+                if (remEl) {
+                    const color = remainder < 0 ? 'text-red-500' : 'text-torn-green';
+                    remEl.innerHTML = `剩余待分配金额: <span class="${color}">$${Utils.formatMoney(remainder)}</span>`;
+                }
+            }
         });
 
         // Save split
@@ -840,6 +866,15 @@ window.FinancePage = {
 
                     const entry = item.entry;
                     const amount = entry.data?.money || entry.data?.amount || 0;
+                    const absAmount = Math.abs(amount);
+                    
+                    let cat = 'other';
+                    let note = entry.title || '自动检测';
+                    
+                    if (absAmount > 0 && absAmount === Number(this.config.weekly_tax_amount)) {
+                        cat = 'tax';
+                        note += ' (自动匹配税费)';
+                    }
                     
                     let ts = entry.timestamp || Date.now();
                     if (ts < 100000000000) ts *= 1000;
@@ -850,9 +885,9 @@ window.FinancePage = {
                         player_name: item.empName,
                         date: Utils.todayKey(),
                         timestamp: ts,
-                        amount: Math.abs(amount),
-                        category: 'other',
-                        note: entry.title || '自动检测'
+                        amount: absAmount,
+                        category: cat,
+                        note: note
                     });
                 }
                 Utils.toast(`已导入 ${checked.length} 条交易`, 'success');
