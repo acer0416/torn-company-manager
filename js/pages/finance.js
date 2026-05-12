@@ -804,23 +804,49 @@ window.FinancePage = {
     },
 
     // Fetch and cache all Torn item names (id -> name)
+    // Loads from bundled static file first, only calls API for missing IDs
     async _loadItemNames() {
         if (Object.keys(this.itemNameCache).length > 0) return;
         try {
-            const data = await TornAPI.v1('items', 'torn');
-            if (data && data.items) {
-                for (const [id, info] of Object.entries(data.items)) {
-                    this.itemNameCache[id] = info.name;
-                }
-                console.log(`[FinancePage] Loaded ${Object.keys(this.itemNameCache).length} item names`);
-            }
+            // Load bundled static item names
+            const url = chrome.runtime.getURL('data/item_names.json');
+            const resp = await fetch(url);
+            const data = await resp.json();
+            this.itemNameCache = data;
+            console.log(`[FinancePage] Loaded ${Object.keys(this.itemNameCache).length} item names from static file`);
         } catch (e) {
-            console.warn('[FinancePage] Failed to load item names:', e);
+            console.warn('[FinancePage] Failed to load static item names, falling back to API:', e);
+            try {
+                const data = await TornAPI.v1('items', 'torn');
+                if (data && data.items) {
+                    for (const [id, info] of Object.entries(data.items)) {
+                        this.itemNameCache[id] = info.name;
+                    }
+                }
+            } catch (e2) {
+                console.warn('[FinancePage] API fallback also failed:', e2);
+            }
         }
     },
 
+    // Look up a single item name, fetch from API if not in cache
+    async _getItemName(itemId) {
+        const id = String(itemId);
+        if (this.itemNameCache[id]) return this.itemNameCache[id];
+        // Not in cache, try API for this single item
+        try {
+            const data = await TornAPI.v1('items', 'torn');
+            if (data && data.items) {
+                for (const [k, info] of Object.entries(data.items)) {
+                    this.itemNameCache[k] = info.name;
+                }
+            }
+        } catch (e) { /* ignore */ }
+        return this.itemNameCache[id] || `物品#${id}`;
+    },
+
     async _autoDetect() {
-        Utils.showLoading('获取物品名称数据库...');
+        Utils.showLoading('加载物品数据...');
         await this._loadItemNames();
         Utils.showLoading('获取员工往来日志...');
         try {
