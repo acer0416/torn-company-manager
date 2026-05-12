@@ -2,6 +2,11 @@
 // Runs independently even when popup is closed
 // Compatible with both Chrome and Firefox (uses chrome.* which both support)
 
+// Open app in new tab when extension icon is clicked
+chrome.action.onClicked.addListener(() => {
+  chrome.tabs.create({ url: chrome.runtime.getURL('popup/index.html') });
+});
+
 // Install handler
 chrome.runtime.onInstalled.addListener(() => {
   console.log('Torn Company Manager installed');

@@ -127,12 +127,17 @@
 
   document.getElementById('btn-open-full')?.addEventListener('click', () => {
     try {
-      chrome.windows.create({
-        url: chrome.runtime.getURL('popup/index.html'),
-        type: 'popup', width: 1280, height: 900
-      });
+      if (chrome.windows) {
+        chrome.windows.create({
+          url: chrome.runtime.getURL('popup/index.html'),
+          state: 'maximized'
+        });
+      } else {
+        // Firefox fallback: open as tab
+        chrome.tabs.create({ url: chrome.runtime.getURL('popup/index.html') });
+      }
     } catch (e) {
-      window.open(window.location.href, '_blank', 'width=1280,height=900');
+      window.open(window.location.href, '_blank');
     }
   });
 

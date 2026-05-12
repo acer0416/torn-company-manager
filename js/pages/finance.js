@@ -834,6 +834,18 @@ window.FinancePage = {
         return total;
     },
 
+    _calculateItemsValueFromList(items) {
+        let total = 0;
+        const cache = this.itemNameCache || {};
+        for (const it of items) {
+            const entry = cache[it.id];
+            if (entry && entry.value) {
+                total += entry.value * (it.qty || 1);
+            }
+        }
+        return total;
+    },
+
     // Fetch and cache all Torn item names (id -> name)
     // Loads from bundled static file first, only calls API for missing IDs
     async _loadItemNames() {
@@ -879,80 +891,70 @@ window.FinancePage = {
     async _autoDetect() {
         Utils.showLoading('加载物品数据...');
         await this._loadItemNames();
-        Utils.showLoading('获取员工往来日志...');
+        Utils.showLoading('获取交易日志...');
         try {
-            console.log('[FinancePage] Fetching user log for auto-detect by target...');
-            
             const existingLogIds = new Set(this.transactions.map(t => String(t.log_id)).filter(id => id && id !== 'undefined'));
             const allRelevant = [];
 
-            for (const emp of this.employees) {
+            // V2 log batches - each batch max 10 log type IDs
+            const batches = [
+                '4800,4810,4102,4103,6284',           // money + items + company deposit
+                '4400,4401,4431,4440,4441,4445,4446,4480,4482,4430' // trades
+            ];
+
+            for (const batch of batches) {
                 try {
-                    const logData = await TornAPI.getUserLogForTarget(emp.player_id);
-                    if (!logData || !logData.log) continue;
+                    const logData = await TornAPI.getUserLogByTypes(batch);
+                    if (!logData || !logData.log || !logData.log.length) continue;
 
-                    const entries = Array.isArray(logData.log) 
-                        ? logData.log.map((v, i) => ({ ...v, _log_id: String(v.id || v.log_id || i) })) 
-                        : Object.entries(logData.log).map(([k, v]) => ({ ...v, _log_id: String(k) }));
-                    
-                    for (const entry of entries) {
-                        const logId = entry._log_id;
-                        if (logId && existingLogIds.has(logId)) continue; 
+                    for (const entry of logData.log) {
+                        const logId = entry.id;
+                        if (!logId || existingLogIds.has(logId)) continue;
 
-                        const cat = (entry.category || '').toLowerCase();
-                        const title = (entry.title || '').toLowerCase();
-                        
-                        const isRelevant = 
-                            cat.includes('money') || 
-                            cat.includes('item') || 
-                            cat.includes('trade') ||
-                            title.includes('money') ||
-                            title.includes('item') ||
-                            title.includes('trade') ||
-                            title.includes('sent you') ||
-                            title.includes('sent to');
+                        const logType = entry.details?.id || 0;
+                        const isTrade = logType >= 4400 && logType <= 4499;
 
-                        if (!isRelevant) continue;
+                        // Extract player ID from data
+                        const d = entry.data || {};
+                        const empId = d.user || d.sender || d.receiver || 0;
 
                         allRelevant.push({
                             log_id: logId,
                             entry: entry,
-                            empName: emp.name,
-                            empId: emp.player_id
+                            empName: '交易对方',
+                            empId: empId,
+                            isTrade: isTrade
                         });
                     }
-                } catch (apiErr) {
-                    console.warn(`[FinancePage] Failed to fetch logs for ${emp.name}: `, apiErr);
+                } catch (e) {
+                    console.warn('[FinancePage] V2 log batch failed:', e);
                 }
             }
-            
+
             Utils.hideLoading();
 
-            if (!allRelevant.length) {
+            // Deduplicate trades
+            const deduped = this._deduplicateTrades(allRelevant);
+
+            if (!deduped.length) {
                 Utils.toast('未找到新的相关日志条目', 'info');
                 return;
             }
 
-            allRelevant.forEach((item, idx) => item.idx = idx);
-            this.adLogs = allRelevant;
+            deduped.forEach((item, idx) => item.idx = idx);
+            this.adLogs = deduped;
             this.adFilterEmp = '';
             this.adFilterTime = 'week';
-
-            const empOptions = this.employees.map(e => `<option value="${e.player_id}">${e.name}</option>`).join('');
 
             const html = `
                 <div class="p-6">
                     <h3 class="text-lg font-bold text-white mb-4">自动检测往来记录</h3>
-                    
+
                     <div class="flex items-center gap-2 mb-4 bg-torn-surface p-2 rounded border border-torn-border overflow-x-auto hide-scrollbar">
                         <select id="modal-ad-filter-time" class="input input-sm shrink-0 truncate" style="max-width: 90px;">
                             <option value="week">本周</option>
                             <option value="month">本月</option>
                             <option value="all">全部时间</option>
-                        </select>
-                        <select id="modal-ad-filter-emp" class="input input-sm shrink-0 truncate" style="max-width: 120px;">
-                            <option value="">全部员工</option>
-                            ${empOptions}
                         </select>
                         <div class="flex items-center gap-2 ml-auto mr-2 whitespace-nowrap shrink-0">
                             <input type="checkbox" id="modal-ad-select-all" class="cursor-pointer" checked />
@@ -961,7 +963,7 @@ window.FinancePage = {
                     </div>
 
                     <div id="modal-ad-list" class="space-y-2 max-h-64 overflow-y-auto mb-4"></div>
-                    
+
                     <div class="flex justify-end gap-2">
                         <button class="btn btn-secondary" id="modal-ad-cancel">取消</button>
                         <button class="btn btn-primary" id="modal-import-btn">导入选中</button>
@@ -974,11 +976,6 @@ window.FinancePage = {
 
             document.getElementById('modal-ad-filter-time')?.addEventListener('change', (e) => {
                 this.adFilterTime = e.target.value;
-                this._renderAutoDetectList();
-            });
-
-            document.getElementById('modal-ad-filter-emp')?.addEventListener('change', (e) => {
-                this.adFilterEmp = e.target.value;
                 this._renderAutoDetectList();
             });
 
@@ -996,43 +993,50 @@ window.FinancePage = {
                     const item = this.adLogs[idx];
                     if (!item) continue;
 
-                    const getDetailsText = (entry) => {
-                        const d = entry.data || {};
-                        const money = Math.abs(d.money || d.cost || d.amount || d.value || 0);
-                        let parts = [];
-                        if (money) parts.push(`${Utils.formatMoney(money)}`);
-                        
-                        // Parse items from all possible API formats
-                        const itemDescriptions = this._parseItemsFromData(d);
-                        parts.push(...itemDescriptions);
-                        
-                        return parts.length ? ` (${parts.join(', ')})` : '';
-                    };
-
                     const entry = item.entry;
-                    const itemsValue = this._calculateItemsValue(entry.data || {});
-                    const cashAmount = entry.data?.money || entry.data?.amount || entry.data?.cost || entry.data?.value || 0;
-                    
-                    // Priority: If cash is present, use cash. If cash is 0 but items have value, use item value.
-                    const finalAmount = Math.abs(cashAmount) || itemsValue;
-                    const absAmount = finalAmount;
-                    
+                    const d = entry.data || {};
+
+                    // Handle synthetic trade entries (aggregated from multiple steps)
+                    let cashAmount, absAmount, note;
+                    if (entry._finalMoney !== undefined || entry._finalItems) {
+                        cashAmount = entry._finalMoney || 0;
+                        const tradeItems = entry._finalItems || [];
+                        const itemsValue = this._calculateItemsValueFromList(tradeItems);
+                        absAmount = Math.abs(cashAmount) || itemsValue;
+                        const tradeId = entry._tradeId || '';
+                        const itemDescs = tradeItems.map(it => {
+                            const name = this.itemNameCache[it.id]?.name || `物品#${it.id}`;
+                            return it.qty > 1 ? `${name} x${it.qty}` : name;
+                        });
+                        note = `交易 #${tradeId}${absAmount > 0 ? ' (' + Utils.formatMoney(absAmount) + (itemDescs.length ? ', ' + itemDescs.join(', ') : '') + ')' : ''}`;
+                    } else {
+                        // Regular V2 log entry
+                        cashAmount = Math.abs(d.money || d.amount || d.cost || d.value || d.withdrawn || 0);
+                        const itemsValue = this._calculateItemsValue(d);
+                        absAmount = cashAmount || itemsValue;
+                        const parts = [];
+                        if (cashAmount) parts.push(Utils.formatMoney(cashAmount));
+                        const itemDescs = this._parseItemsFromData(d);
+                        parts.push(...itemDescs);
+                        const title = entry.details?.title || '自动检测';
+                        note = title + (parts.length ? ` (${parts.join(', ')})` : '');
+                    }
+
                     let cat = 'other';
-                    let note = (entry.title || '自动检测') + getDetailsText(entry);
-                    
                     if (absAmount > 0 && absAmount === Number(this.config.weekly_tax_amount)) {
                         cat = 'tax';
                         note += ' (自动匹配税费)';
                     }
-                    
+
                     let ts = entry.timestamp || Date.now();
                     if (ts < 100000000000) ts *= 1000;
+                    const txDate = new Date(ts).toISOString().slice(0, 10);
 
                     await DB.put('transactions', {
                         log_id: item.log_id,
                         player_id: item.empId,
                         player_name: item.empName,
-                        date: Utils.todayKey(),
+                        date: txDate,
                         timestamp: ts,
                         amount: absAmount,
                         category: cat,
@@ -1047,6 +1051,70 @@ window.FinancePage = {
             Utils.hideLoading();
             Utils.toast(`获取日志失败: ${e.message}`, 'error');
         }
+    },
+
+    _deduplicateTrades(allRelevant) {
+        const tradeEntries = [];
+        const nonTrade = [];
+
+        for (const item of allRelevant) {
+            if (item.isTrade) {
+                tradeEntries.push(item);
+            } else {
+                nonTrade.push(item);
+            }
+        }
+
+        // Group trade entries by parsed_trade_id
+        const byTradeId = {};
+        for (const item of tradeEntries) {
+            const tradeId = item.entry?.data?.parsed_trade_id;
+            if (!tradeId) { nonTrade.push(item); continue; }
+            if (!byTradeId[tradeId]) byTradeId[tradeId] = [];
+            byTradeId[tradeId].push(item);
+        }
+
+        const dedupedTrade = [];
+        for (const [tradeId, steps] of Object.entries(byTradeId)) {
+            steps.sort((a, b) => (a.entry.timestamp || 0) - (b.entry.timestamp || 0));
+
+            // Completed trade: any step has 'total' field
+            const hasTotal = steps.some(s => s.entry?.data?.total !== undefined);
+            if (!hasTotal) continue;
+
+            // Aggregate money and items from all steps
+            let totalMoney = 0;
+            const allItems = [];
+            const traderUser = steps[0]?.entry?.data?.user || 0;
+
+            for (const step of steps) {
+                const d = step.entry?.data || {};
+                if (d.money) totalMoney += d.money;
+                if (d.items) allItems.push(...d.items);
+            }
+
+            // Merge duplicate items
+            const merged = {};
+            for (const it of allItems) {
+                const k = `${it.id}_${it.uid || ''}`;
+                merged[k] = merged[k] ? { ...merged[k], qty: merged[k].qty + it.qty } : { ...it };
+            }
+
+            dedupedTrade.push({
+                log_id: `trade_final_${tradeId}`,
+                entry: {
+                    ...steps[steps.length - 1].entry,
+                    _tradeId: tradeId,
+                    _finalMoney: totalMoney,
+                    _finalItems: Object.values(merged)
+                },
+                empName: '交易对方',
+                empId: traderUser,
+                isTrade: true
+            });
+        }
+
+        return [...nonTrade, ...dedupedTrade];
     },
 
     _renderAutoDetectList() {

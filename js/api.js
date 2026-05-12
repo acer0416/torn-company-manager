@@ -77,6 +77,7 @@ const TornAPI = {
   async getUserEvents() { return this.v1('events', 'user'); },
   async getUserLog(offset = 0) { return this.v1('log', 'user', `offset=${offset}`); },
   async getUserLogForTarget(target) { return this.v1('log', 'user', `target=${target}`); },
+  async getUserLogByTypes(logIds, limit = 100) { return this.v2(`/user/log?log=${logIds}&limit=${limit}`); },
   async getCompanyTypes() { return this.v1('companies', 'torn'); },
   async getPlayerProfile(id) { return this.v1('profile,basic', 'user', `id=${id}`); },
   async getPlayerEvents(id) { return this.v1('events', 'user', `id=${id}`); },

@@ -6,7 +6,8 @@
   "permissions": [
     "storage",
     "alarms",
-    "notifications"
+    "notifications",
+    "tabs"
   ],
   "host_permissions": [
     "https://api.torn.com/*"
@@ -22,8 +23,7 @@
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
-    },
-    "default_popup": "popup/index.html"
+    }
   },
   "background": {
     "scripts": ["background/service-worker.js"]
