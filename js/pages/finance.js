@@ -433,15 +433,6 @@ window.FinancePage = {
             } else if (e.target.id === 'tx-select-all') {
                 const checkboxes = c.querySelectorAll('.tx-row-cb');
                 checkboxes.forEach(cb => cb.checked = e.target.checked);
-            } else if (e.target.id === 'modal-ad-filter-emp') {
-                this.adFilterEmp = e.target.value;
-                this._renderAutoDetectList();
-            } else if (e.target.id === 'modal-ad-filter-time') {
-                this.adFilterTime = e.target.value;
-                this._renderAutoDetectList();
-            } else if (e.target.id === 'modal-ad-select-all') {
-                const checkboxes = document.querySelectorAll('.log-entry-cb');
-                checkboxes.forEach(cb => cb.checked = e.target.checked);
             } else if (e.target.classList.contains('tx-cat-select')) {
                 const txId = Number(e.target.dataset.txId);
                 const tx = this.transactions.find(t => t.id === txId);
@@ -881,6 +872,21 @@ window.FinancePage = {
 
             Utils.showModal(html);
             this._renderAutoDetectList();
+
+            document.getElementById('modal-ad-filter-time')?.addEventListener('change', (e) => {
+                this.adFilterTime = e.target.value;
+                this._renderAutoDetectList();
+            });
+
+            document.getElementById('modal-ad-filter-emp')?.addEventListener('change', (e) => {
+                this.adFilterEmp = e.target.value;
+                this._renderAutoDetectList();
+            });
+
+            document.getElementById('modal-ad-select-all')?.addEventListener('change', (e) => {
+                const checkboxes = document.querySelectorAll('.log-entry-cb');
+                checkboxes.forEach(cb => cb.checked = e.target.checked);
+            });
 
             document.getElementById('modal-ad-cancel')?.addEventListener('click', () => Utils.hideModal());
 
