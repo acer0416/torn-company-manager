@@ -399,7 +399,7 @@ window.FinancePage = {
                 <div class="flex items-end gap-4 mb-6">
                     <div class="flex-1 max-w-xs">
                         <label class="text-gray-400 text-sm mb-1 block">每周应缴税款 ($)</label>
-                        <input type="text" class="input" id="cfg-weekly-tax" value="${weeklyTax}" placeholder="支持 k/m/b 后缀" />
+                        <input type="text" class="input money-input" id="cfg-weekly-tax" value="${weeklyTax}" placeholder="支持 k/m/b 后缀" />
                     </div>
                     <button class="btn btn-primary" data-action="save-tax-config">
                         <i class="fas fa-save"></i> 保存
@@ -558,7 +558,7 @@ window.FinancePage = {
                     </div>
                     <div>
                         <label class="text-gray-400 text-sm mb-1 block">金额 ($)</label>
-                        <input type="text" class="input" id="modal-tx-amount" placeholder="支持 k/m/b 后缀" />
+                        <input type="text" class="input money-input" id="modal-tx-amount" placeholder="支持 k/m/b 后缀" />
                     </div>
                     <div>
                         <label class="text-gray-400 text-sm mb-1 block">分类</label>
@@ -614,7 +614,7 @@ window.FinancePage = {
                 <div class="space-y-4">
                     <div>
                         <label class="text-gray-400 text-sm mb-1 block">金额 ($)</label>
-                        <input type="text" class="input" id="modal-edit-amount" value="${tx.amount || 0}" placeholder="支持 k/m/b 后缀" />
+                        <input type="text" class="input money-input" id="modal-edit-amount" value="${tx.amount || 0}" placeholder="支持 k/m/b 后缀" />
                     </div>
                     <div>
                         <label class="text-gray-400 text-sm mb-1 block">分类</label>
@@ -744,7 +744,7 @@ window.FinancePage = {
             <div class="flex gap-2 items-end">
                 <div class="flex-1">
                     <label class="text-gray-400 text-xs block">部分${index} 金额</label>
-                    <input type="text" class="input input-sm split-amount" placeholder="支持 k/m/b" />
+                    <input type="text" class="input input-sm split-amount money-input" placeholder="支持 k/m/b" />
                 </div>
                 <div class="flex-1">
                     <label class="text-gray-400 text-xs block">分类</label>
@@ -957,3 +957,16 @@ window.FinancePage = {
         if (selectAllCb) selectAllCb.checked = true;
     }
 };
+
+// Global real-time conversion for money inputs (k, m, b)
+document.body.addEventListener('input', (e) => {
+    if (e.target && e.target.classList && e.target.classList.contains('money-input')) {
+        const val = e.target.value.toLowerCase().trim();
+        if (val.endsWith('k') || val.endsWith('m') || val.endsWith('b')) {
+            const parsed = Utils.parseMoneyInput(val);
+            if (parsed && !isNaN(parsed)) {
+                e.target.value = parsed.toLocaleString('en-US');
+            }
+        }
+    }
+});
