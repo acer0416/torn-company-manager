@@ -665,7 +665,7 @@ window.FinancePage = {
                     ${this._splitPartHTML(2)}
                 </div>
                 <div class="text-sm font-bold text-torn-accent mb-4" id="split-remainder">
-                    剩余待分配金额: $${Utils.formatMoney(tx.amount)}
+                    剩余待分配金额: ${Utils.formatMoney(tx.amount)}
                 </div>
                 <button class="btn btn-xs btn-secondary mb-4" data-action="add-split-part">+ 添加部分</button>
                 <div class="flex justify-end gap-2">
@@ -697,7 +697,25 @@ window.FinancePage = {
                 const remEl = document.getElementById('split-remainder');
                 if (remEl) {
                     const color = remainder < 0 ? 'text-red-500' : 'text-torn-green';
-                    remEl.innerHTML = `剩余待分配金额: <span class="${color}">$${Utils.formatMoney(remainder)}</span>`;
+                    remEl.innerHTML = `剩余待分配金额: <span class="${color}">${Utils.formatMoney(remainder)}</span>`;
+                }
+            }
+        });
+
+        // Add click listener for fill remainder buttons
+        document.getElementById('split-parts')?.addEventListener('click', (e) => {
+            if (e.target.classList.contains('split-fill-rem')) {
+                e.preventDefault();
+                const amounts = [...document.querySelectorAll('.split-amount')].map(el => Utils.parseMoneyInput(el.value));
+                const total = amounts.reduce((s, a) => s + a, 0);
+                const remainder = tx.amount - total;
+                if (remainder > 0) {
+                    const input = e.target.closest('.flex-1').querySelector('.split-amount');
+                    if (input) {
+                        const curVal = Utils.parseMoneyInput(input.value);
+                        input.value = Utils.formatMoney(curVal + remainder).replace('$', '');
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
                 }
             }
         });
@@ -711,6 +729,10 @@ window.FinancePage = {
             const total = amounts.reduce((s, a) => s + a, 0);
             if (total > tx.amount + 1) {
                 Utils.toast('拆分金额超过原始金额', 'error');
+                return;
+            }
+            if (total < tx.amount) {
+                Utils.toast('拆分不完整，存在未分配的余额', 'error');
                 return;
             }
 
@@ -739,12 +761,15 @@ window.FinancePage = {
         });
     },
 
-    _splitPartHTML(index) {
+    _splitPartHTML(index, amount = '') {
         return `
             <div class="flex gap-2 items-end">
                 <div class="flex-1">
-                    <label class="text-gray-400 text-xs block">部分${index} 金额</label>
-                    <input type="text" class="input input-sm split-amount money-input" placeholder="支持 k/m/b" />
+                    <div class="flex justify-between items-center mb-1">
+                        <label class="text-gray-400 text-xs block">部分${index} 金额</label>
+                        <a href="#" class="text-torn-accent text-xs hover:underline split-fill-rem" tabindex="-1">填入余额</a>
+                    </div>
+                    <input type="text" class="input input-sm split-amount money-input" placeholder="支持 k/m/b" value="${amount}" />
                 </div>
                 <div class="flex-1">
                     <label class="text-gray-400 text-xs block">分类</label>
@@ -768,7 +793,7 @@ window.FinancePage = {
         try {
             console.log('[FinancePage] Fetching user log for auto-detect by target...');
             
-            const existingLogIds = new Set(this.transactions.map(t => t.log_id).filter(Boolean));
+            const existingLogIds = new Set(this.transactions.map(t => String(t.log_id)).filter(id => id && id !== 'undefined'));
             const allRelevant = [];
 
             for (const emp of this.employees) {
