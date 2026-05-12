@@ -781,34 +781,57 @@ window.FinancePage = {
         `;
     },
 
-    // Parse item descriptions from Torn API log data
-    // API formats:
-    //   "Item receive/send" (log 4103): data.items = [{id, uid, qty}]
-    //   "Faction loan item" (log 6745/6746): data.item = [{id, uid, qty}]
-    //   "Item use" (log 2290): data.item = 206 (number)
     _parseItemsFromData(d) {
         const results = [];
         const cache = this.itemNameCache || {};
 
-        // Collect item entries from both data.item and data.items
         const itemEntries = [];
         if (Array.isArray(d.item)) itemEntries.push(...d.item);
         if (Array.isArray(d.items)) itemEntries.push(...d.items);
 
         for (const it of itemEntries) {
-            const name = cache[it.id] || `物品#${it.id}`;
+            const entry = cache[it.id];
+            const name = entry ? entry.name : `物品#${it.id}`;
             const qty = it.qty || it.quantity || 1;
             results.push(qty > 1 ? `${name} x${qty}` : name);
         }
 
-        // Single item as number (e.g. "Item use xanax": data.item = 206)
         if (typeof d.item === 'number') {
-            const name = cache[d.item] || `物品#${d.item}`;
+            const entry = cache[d.item];
+            const name = entry ? entry.name : `物品#${d.item}`;
             const qty = d.quantity || 1;
             results.push(qty > 1 ? `${name} x${qty}` : name);
         }
 
         return results;
+    },
+
+    // Calculate total monetary value of items in log data
+    _calculateItemsValue(d) {
+        let total = 0;
+        const cache = this.itemNameCache || {};
+
+        const itemEntries = [];
+        if (Array.isArray(d.item)) itemEntries.push(...d.item);
+        if (Array.isArray(d.items)) itemEntries.push(...d.items);
+
+        for (const it of itemEntries) {
+            const entry = cache[it.id];
+            if (entry && entry.value) {
+                const qty = it.qty || it.quantity || 1;
+                total += entry.value * qty;
+            }
+        }
+
+        if (typeof d.item === 'number') {
+            const entry = cache[d.item];
+            if (entry && entry.value) {
+                const qty = d.quantity || 1;
+                total += entry.value * qty;
+            }
+        }
+
+        return total;
     },
 
     // Fetch and cache all Torn item names (id -> name)
@@ -840,17 +863,17 @@ window.FinancePage = {
     // Look up a single item name, fetch from API if not in cache
     async _getItemName(itemId) {
         const id = String(itemId);
-        if (this.itemNameCache[id]) return this.itemNameCache[id];
+        if (this.itemNameCache[id]) return this.itemNameCache[id].name;
         // Not in cache, try API for this single item
         try {
             const data = await TornAPI.v1('items', 'torn');
             if (data && data.items) {
                 for (const [k, info] of Object.entries(data.items)) {
-                    this.itemNameCache[k] = info.name;
+                    this.itemNameCache[k] = { name: info.name, value: info.market_value || 0 };
                 }
             }
         } catch (e) { /* ignore */ }
-        return this.itemNameCache[id] || `物品#${id}`;
+        return this.itemNameCache[id] ? this.itemNameCache[id].name : `物品#${id}`;
     },
 
     async _autoDetect() {
@@ -987,8 +1010,12 @@ window.FinancePage = {
                     };
 
                     const entry = item.entry;
-                    const amount = entry.data?.money || entry.data?.amount || entry.data?.cost || entry.data?.value || 0;
-                    const absAmount = Math.abs(amount);
+                    const itemsValue = this._calculateItemsValue(entry.data || {});
+                    const cashAmount = entry.data?.money || entry.data?.amount || entry.data?.cost || entry.data?.value || 0;
+                    
+                    // Priority: If cash is present, use cash. If cash is 0 but items have value, use item value.
+                    const finalAmount = Math.abs(cashAmount) || itemsValue;
+                    const absAmount = finalAmount;
                     
                     let cat = 'other';
                     let note = (entry.title || '自动检测') + getDetailsText(entry);
@@ -1051,8 +1078,11 @@ window.FinancePage = {
         const getDetails = (entry) => {
             const d = entry.data || {};
             const money = Math.abs(d.money || d.cost || d.amount || d.value || 0);
+            const itemsValue = this._calculateItemsValue(d);
+            
             let parts = [];
             if (money) parts.push(`${Utils.formatMoney(money)}`);
+            if (itemsValue && !money) parts.push(`价值 ${Utils.formatMoney(itemsValue)}`);
             
             // Parse items from all possible API formats
             const itemDescriptions = this._parseItemsFromData(d);
