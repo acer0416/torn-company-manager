@@ -3,3 +3,6 @@ node_modules/
 .idea/
 .vscode/
 *.log
+AGENTS.md
+.roo/
+torn V2 api*.md
