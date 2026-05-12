@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Torn Company Manager</title>
+  <link rel="stylesheet" href="../css/tailwind.min.css">
+  <link rel="stylesheet" href="../css/style.css">
+  <link rel="stylesheet" href="../css/fontawesome/all.min.css">
+</head>
+<body class="bg-torn-bg text-gray-200 min-h-screen">
+  <!-- Top Bar -->
+  <header class="bg-torn-card border-b border-torn-border sticky top-0 z-50 h-12 flex items-center px-4 justify-between">
+    <div class="flex items-center gap-2">
+      <i class="fas fa-building text-torn-accent"></i>
+      <span class="font-bold text-white text-sm">Torn Company Manager</span>
+    </div>
+    <div class="flex items-center gap-3">
+      <span id="header-company" class="text-xs text-gray-400 hidden">
+        <i class="fas fa-star text-torn-gold mr-1"></i><span id="header-company-name"></span>
+      </span>
+      <span id="header-status" class="text-xs hidden">
+        <span class="status-dot status-online mr-1"></span>
+        <span class="text-gray-400">已连接</span>
+      </span>
+      <button id="btn-open-full" class="text-gray-400 hover:text-white text-sm" title="新窗口打开">
+        <i class="fas fa-external-link-alt"></i>
+      </button>
+    </div>
+  </header>
+
+  <div class="flex h-[calc(100vh-3rem)]">
+    <!-- Sidebar Nav -->
+    <nav class="w-44 bg-torn-surface border-r border-torn-border flex-shrink-0 overflow-y-auto py-2">
+      <a href="#/" class="nav-item active" data-page="dashboard">
+        <i class="fas fa-tachometer-alt w-4 text-center"></i><span>仪表盘</span>
+      </a>
+      <a href="#/employees" class="nav-item" data-page="employees">
+        <i class="fas fa-users w-4 text-center"></i><span>员工管理</span>
+      </a>
+      <a href="#/training" class="nav-item" data-page="training">
+        <i class="fas fa-dumbbell w-4 text-center"></i><span>训练管理</span>
+      </a>
+      <a href="#/stock" class="nav-item" data-page="stock">
+        <i class="fas fa-boxes-stacked w-4 text-center"></i><span>库存定价</span>
+      </a>
+      <a href="#/finance" class="nav-item" data-page="finance">
+        <i class="fas fa-coins w-4 text-center"></i><span>财务管理</span>
+      </a>
+      <a href="#/rehab" class="nav-item" data-page="rehab">
+        <i class="fas fa-syringe w-4 text-center"></i><span>毒瘾监控</span>
+      </a>
+      <a href="#/boost" class="nav-item" data-page="boost">
+        <i class="fas fa-rocket w-4 text-center"></i><span>Boost管理</span>
+      </a>
+      <div class="border-t border-torn-border my-2 mx-3"></div>
+      <a href="#/data" class="nav-item" data-page="data">
+        <i class="fas fa-database w-4 text-center"></i><span>数据管理</span>
+      </a>
+      <a href="#/settings" class="nav-item" data-page="settings">
+        <i class="fas fa-cog w-4 text-center"></i><span>设置</span>
+      </a>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="flex-1 overflow-y-auto p-4" id="main-content">
+      <div id="toast-container" class="fixed top-14 right-4 z-50 flex flex-col gap-2"></div>
+
+      <!-- Loading overlay -->
+      <div id="loading" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center">
+        <div class="bg-torn-card rounded-lg p-6 flex items-center gap-3 border border-torn-border">
+          <i class="fas fa-spinner fa-spin text-torn-accent text-xl"></i>
+          <span id="loading-text" class="text-gray-200">加载中...</span>
+        </div>
+      </div>
+
+      <div id="page-content"></div>
+    </main>
+  </div>
+
+  <!-- Modal -->
+  <div id="modal-overlay" class="hidden fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+    <div id="modal-content" class="bg-torn-card rounded-xl border border-torn-border max-w-lg w-full max-h-[80vh] overflow-y-auto"></div>
+  </div>
+
+  <!-- Scripts (non-module for popup context) -->
+  <script src="../js/browser-compat.js"></script>
+  <script src="../js/utils.js"></script>
+  <script src="../js/db.js"></script>
+  <script src="../js/api.js"></script>
+  <script src="../js/components.js"></script>
+  <script src="../js/pages/dashboard.js"></script>
+  <script src="../js/pages/employees.js"></script>
+  <script src="../js/pages/training.js"></script>
+  <script src="../js/pages/stock.js"></script>
+  <script src="../js/pages/finance.js"></script>
+  <script src="../js/pages/rehab.js"></script>
+  <script src="../js/pages/boost.js"></script>
+  <script src="../js/pages/data.js"></script>
+  <script src="../js/pages/settings.js"></script>
+  <script src="../js/router.js"></script>
+  <script src="../js/app.js"></script>
+</body>
+</html>
