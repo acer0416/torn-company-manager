@@ -15,6 +15,7 @@ window.FinancePage = {
     adLogs: [],
     adFilterEmp: '',
     adFilterTime: 'week',
+    itemNameCache: {},  // item ID -> name lookup
 
     async init() {
         await this.render();
@@ -780,60 +781,47 @@ window.FinancePage = {
         `;
     },
 
-    // Parse item descriptions from Torn API log data (handles all formats)
+    // Parse item descriptions from Torn API log data
+    // Actual API format: data.item = [{id: 256, uid: null, qty: 100}]
     _parseItemsFromData(d) {
         const results = [];
+        const cache = this.itemNameCache || {};
 
-        // Helper to extract name from a single item entry
-        const extractName = (obj) => {
-            if (typeof obj === 'string') return obj;
-            if (typeof obj === 'number') return `物品#${obj}`;
-            if (obj && typeof obj === 'object') {
-                return obj.name || obj.item_name || obj.title || (obj.id ? `物品#${obj.id}` : null);
-            }
-            return null;
-        };
-
-        const extractQty = (obj) => {
-            if (obj && typeof obj === 'object') {
-                return obj.quantity || obj.amount || obj.qty || 0;
-            }
-            return 0;
-        };
-
-        // Case 1: d.item exists
-        if (d.item != null) {
-            const name = d.item_name || extractName(d.item);
-            const qty = (typeof d.quantity === 'number' ? d.quantity : 0) || extractQty(d.item) || 1;
-            if (name) {
+        // data.item is an array of {id, uid, qty}
+        if (Array.isArray(d.item)) {
+            for (const it of d.item) {
+                const name = cache[it.id] || `物品#${it.id}`;
+                const qty = it.qty || it.quantity || 1;
                 results.push(qty > 1 ? `${name} x${qty}` : name);
             }
-        }
-
-        // Case 2: d.items exists (could be array, object, or number)
-        if (d.items != null && typeof d.items !== 'number') {
-            const itemsArr = Array.isArray(d.items) ? d.items : Object.values(d.items);
-            for (const it of itemsArr) {
-                const name = extractName(it);
-                const qty = extractQty(it) || 1;
-                if (name) {
-                    results.push(qty > 1 ? `${name} x${qty}` : name);
-                }
-            }
-        } else if (typeof d.items === 'number' && d.items > 0 && results.length === 0) {
-            results.push(`${d.items}件物品`);
-        }
-
-        // Case 3: only d.quantity + d.name (no item/items)
-        if (results.length === 0 && d.name) {
-            const qty = typeof d.quantity === 'number' ? d.quantity : 1;
-            results.push(qty > 1 ? `${d.name} x${qty}` : d.name);
+        } else if (typeof d.item === 'number') {
+            const name = cache[d.item] || `物品#${d.item}`;
+            const qty = d.quantity || 1;
+            results.push(qty > 1 ? `${name} x${qty}` : name);
         }
 
         return results;
     },
 
+    // Fetch and cache all Torn item names (id -> name)
+    async _loadItemNames() {
+        if (Object.keys(this.itemNameCache).length > 0) return;
+        try {
+            const data = await TornAPI.v1('items', 'torn');
+            if (data && data.items) {
+                for (const [id, info] of Object.entries(data.items)) {
+                    this.itemNameCache[id] = info.name;
+                }
+                console.log(`[FinancePage] Loaded ${Object.keys(this.itemNameCache).length} item names`);
+            }
+        } catch (e) {
+            console.warn('[FinancePage] Failed to load item names:', e);
+        }
+    },
+
     async _autoDetect() {
+        Utils.showLoading('获取物品名称数据库...');
+        await this._loadItemNames();
         Utils.showLoading('获取员工往来日志...');
         try {
             console.log('[FinancePage] Fetching user log for auto-detect by target...');
