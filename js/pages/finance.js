@@ -898,7 +898,7 @@ window.FinancePage = {
             const itemName = d.item_name || (typeof d.item === 'string' ? d.item : '');
             
             let parts = [];
-            if (money) parts.push(`$${Utils.formatMoney(money)}`);
+            if (money) parts.push(`${Utils.formatMoney(money)}`);
             if (itemName && qty) parts.push(`${itemName} x${qty}`);
             else if (itemName) parts.push(`${itemName}`);
             else if (qty) parts.push(`${qty}件物品`);
