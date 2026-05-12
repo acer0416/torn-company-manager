@@ -801,10 +801,12 @@ window.FinancePage = {
                     const logData = await TornAPI.getUserLogForTarget(emp.player_id);
                     if (!logData || !logData.log) continue;
 
-                    const entries = Array.isArray(logData.log) ? logData.log : Object.values(logData.log);
+                    const entries = Array.isArray(logData.log) 
+                        ? logData.log.map((v, i) => ({ ...v, _log_id: String(v.id || v.log_id || i) })) 
+                        : Object.entries(logData.log).map(([k, v]) => ({ ...v, _log_id: String(k) }));
                     
                     for (const entry of entries) {
-                        const logId = String(entry.id || entry.log_id || '');
+                        const logId = entry._log_id;
                         if (logId && existingLogIds.has(logId)) continue; 
 
                         const cat = (entry.category || '').toLowerCase();
