@@ -748,8 +748,8 @@ window.FinancePage = {
                         date: tx.date,
                         timestamp: Date.now(),
                         amount: amounts[i],
-                        category: cats[i],
-                        note: notes[i] || `从交易#${tx.id}拆分`,
+                        category: cats[i] || 'other',
+                        note: notes[i] || `拆分自 ${Utils.formatDateTime(tx.timestamp)} (${Utils.formatMoney(tx.amount)})`,
                         split_from: tx.id
                     });
                 }
