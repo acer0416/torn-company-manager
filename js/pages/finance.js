@@ -133,8 +133,8 @@ window.FinancePage = {
         const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
         // Calculate transaction sums
-        let weekTax = 0, weekTrain = 0, weekBoost = 0;
-        let monthTax = 0, monthTrain = 0, monthBoost = 0;
+        let weekTax = 0, weekTrain = 0, weekBoost = 0, weekOther = 0;
+        let monthTax = 0, monthTrain = 0, monthBoost = 0, monthOther = 0;
 
         for (const tx of this.transactions) {
             let ts = tx.timestamp || 0;
@@ -142,13 +142,15 @@ window.FinancePage = {
 
             if (ts >= startOfWeek.getTime()) {
                 if (tx.category === 'tax') weekTax += tx.amount;
-                if (tx.category === 'train') weekTrain += tx.amount;
-                if (tx.category === 'boost') weekBoost += tx.amount;
+                else if (tx.category === 'train') weekTrain += tx.amount;
+                else if (tx.category === 'boost') weekBoost += tx.amount;
+                else weekOther += tx.amount;
             }
             if (ts >= startOfMonth.getTime()) {
                 if (tx.category === 'tax') monthTax += tx.amount;
-                if (tx.category === 'train') monthTrain += tx.amount;
-                if (tx.category === 'boost') monthBoost += tx.amount;
+                else if (tx.category === 'train') monthTrain += tx.amount;
+                else if (tx.category === 'boost') monthBoost += tx.amount;
+                else monthOther += tx.amount;
             }
         }
 
@@ -168,12 +170,12 @@ window.FinancePage = {
         const weekAdFeeAPI = dailyAdFee * 7;
         const weekCostAPI = dailyCost * 7;
         
-        const weekTotalIncome = weekTax + weekTrain + weekIncomeAPI;
+        const weekTotalIncome = weekTax + weekTrain + weekOther + weekIncomeAPI;
         const weekTotalExpense = weekBoost + weekCostAPI + weekAdFeeAPI;
         const weekNetProfit = weekTotalIncome - weekTotalExpense;
 
         // Calculate Monthly (当月已发生的数据 + 本周的预测数据)
-        const monthTotalIncome = monthTax + monthTrain + weekIncomeAPI;
+        const monthTotalIncome = monthTax + monthTrain + monthOther + weekIncomeAPI;
         const monthTotalExpense = monthBoost + weekCostAPI + weekAdFeeAPI;
         const monthNetProfit = monthTotalIncome - monthTotalExpense;
 
@@ -184,7 +186,7 @@ window.FinancePage = {
                 </h3>
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
                     ${UI.kpiCard('fas fa-arrow-down', '总支出', Utils.formatMoney(weekTotalExpense), '成本+广告+Boost', 'red')}
-                    ${UI.kpiCard('fas fa-arrow-up', '总收入', Utils.formatMoney(weekTotalIncome), '税费+训练+日收入', 'green')}
+                    ${UI.kpiCard('fas fa-arrow-up', '总收入', Utils.formatMoney(weekTotalIncome), '税费+训练+其他+日收入', 'green')}
                     ${UI.kpiCard('fas fa-balance-scale', '净利润', Utils.formatMoney(weekNetProfit), '收入 - 支出', weekNetProfit >= 0 ? 'accent' : 'red')}
                 </div>
 
@@ -219,6 +221,10 @@ window.FinancePage = {
                             <div class="flex justify-between text-gray-300">
                                 <span>员工训练费 (记录):</span>
                                 <span class="font-mono text-white">${Utils.formatMoney(weekTrain)}</span>
+                            </div>
+                            <div class="flex justify-between text-gray-300">
+                                <span>其他收入 (记录):</span>
+                                <span class="font-mono text-white">${Utils.formatMoney(weekOther)}</span>
                             </div>
                             <div class="flex justify-between text-gray-300">
                                 <span>公司日收入预估 (API):</span>
@@ -300,7 +306,6 @@ window.FinancePage = {
                 <select class="input input-xs bg-torn-surface border border-torn-border cursor-pointer tx-cat-select max-w-[80px]" data-tx-id="${tx.id}">
                     <option value="train" ${cat === 'train' ? 'selected' : ''}>训练</option>
                     <option value="tax" ${cat === 'tax' ? 'selected' : ''}>税务</option>
-                    <option value="boost" ${cat === 'boost' ? 'selected' : ''}>加成</option>
                     <option value="other" ${cat === 'other' ? 'selected' : ''}>其他</option>
                 </select>
             `;
@@ -346,6 +351,9 @@ window.FinancePage = {
                         </select>
                         <button class="btn btn-sm btn-secondary whitespace-nowrap shrink-0" data-action="auto-detect">
                             <i class="fas fa-search"></i> 自动检测
+                        </button>
+                        <button class="btn btn-sm btn-secondary whitespace-nowrap shrink-0" data-action="bulk-edit-category">
+                            <i class="fas fa-tag"></i> 批量分类
                         </button>
                         <button class="btn btn-sm bg-red-900/50 hover:bg-red-900 text-red-200 border border-red-800 whitespace-nowrap shrink-0" data-action="bulk-delete-tx">
                             <i class="fas fa-trash"></i> 批量删除
@@ -477,6 +485,9 @@ window.FinancePage = {
                 case 'delete-tx':
                     await this._deleteTx(Number(btn.dataset.txId));
                     break;
+                case 'bulk-edit-category':
+                    await this._bulkEditCategory();
+                    break;
                 case 'bulk-delete-tx':
                     await this._bulkDeleteTx();
                     break;
@@ -531,6 +542,190 @@ window.FinancePage = {
         await this.render();
     },
 
+    async _bulkEditCategory() {
+        const checkboxes = document.querySelectorAll('.tx-row-cb:checked');
+        if (!checkboxes.length) {
+            Utils.toast('请先选中要修改分类的记录', 'warning');
+            return;
+        }
+
+        const count = checkboxes.length;
+        const html = `
+            <div class="p-6">
+                <h3 class="text-lg font-bold text-white mb-4">批量修改分类</h3>
+                <div class="text-gray-400 text-sm mb-4">已选中 <span class="text-torn-accent font-bold">${count}</span> 条记录</div>
+                <div class="mb-6">
+                    <label class="text-gray-400 text-sm mb-1 block">目标分类</label>
+                    <select class="input" id="bulk-edit-cat">
+                        <option value="train">训练 (train)</option>
+                        <option value="tax">税务 (tax)</option>
+                        <option value="other">其他 (other)</option>
+                    </select>
+                </div>
+                <div class="flex justify-end gap-2">
+                    <button class="btn btn-secondary" id="bulk-edit-cancel">取消</button>
+                    <button class="btn btn-primary" id="bulk-edit-save">确认修改</button>
+                </div>
+            </div>
+        `;
+
+        Utils.showModal(html);
+
+        document.getElementById('bulk-edit-cancel')?.addEventListener('click', () => Utils.hideModal());
+
+        document.getElementById('bulk-edit-save')?.addEventListener('click', async () => {
+            const newCat = document.getElementById('bulk-edit-cat')?.value || 'other';
+            const taxAmount = this.config.weekly_tax_amount || 0;
+
+            // When targeting 'tax' with a configured tax amount, detect over-amount items
+            if (newCat === 'tax' && taxAmount > 0) {
+                const allSelected = [];
+                for (const cb of checkboxes) {
+                    const txId = Number(cb.dataset.txId);
+                    const tx = this.transactions.find(t => t.id === txId);
+                    if (tx) allSelected.push(tx);
+                }
+
+                const overTaxItems = allSelected.filter(tx => tx.amount > taxAmount);
+                const directTaxItems = allSelected.filter(tx => tx.amount <= taxAmount);
+
+                if (overTaxItems.length > 0) {
+                    Utils.hideModal();
+                    this._showBulkTaxSplitModal(overTaxItems, directTaxItems, taxAmount);
+                    return;
+                }
+            }
+
+            // Default: directly set category for all
+            let updated = 0;
+            for (const cb of checkboxes) {
+                const txId = Number(cb.dataset.txId);
+                const tx = this.transactions.find(t => t.id === txId);
+                if (tx) {
+                    tx.category = newCat;
+                    await DB.put('transactions', tx);
+                    updated++;
+                }
+            }
+            Utils.toast(`已成功修改 ${updated} 条记录的分类`, 'success');
+            Utils.hideModal();
+            await this.render();
+        });
+    },
+
+    _showBulkTaxSplitModal(overTaxItems, directTaxItems, taxAmount) {
+        // Build rows: one per over-tax item
+        const rowHTML = overTaxItems.map(tx => {
+            const remaining = tx.amount - taxAmount;
+            return `
+                <div class="flex items-center gap-3 p-3 bg-torn-surface border border-torn-border rounded">
+                    <input type="checkbox" class="split-tax-cb" data-tx-id="${tx.id}" checked />
+                    <div class="flex-1 min-w-0">
+                        <div class="text-white text-sm truncate">${tx.player_name || 'N/A'}</div>
+                        <div class="text-gray-500 text-xs">原金额: ${Utils.formatMoney(tx.amount)}</div>
+                    </div>
+                    <div class="text-sm text-gray-400 whitespace-nowrap">
+                        税务: <span class="text-torn-gold font-mono">${Utils.formatMoney(taxAmount)}</span>
+                    </div>
+                    <div class="text-sm whitespace-nowrap">
+                        剩余: <span class="text-torn-green font-mono">${Utils.formatMoney(remaining)}</span>
+                    </div>
+                    <select class="input input-xs bg-torn-surface border border-torn-border split-remainder-cat" style="max-width:100px">
+                        <option value="train">train</option>
+                        <option value="other">other</option>
+                    </select>
+                    <input type="hidden" class="split-remainder-amount" value="${remaining}" />
+                </div>
+            `;
+        }).join('');
+
+        const directCount = directTaxItems.length;
+        const directNote = directCount > 0
+            ? `<div class="text-gray-400 text-sm mb-2">另有 <span class="text-torn-accent">${directCount}</span> 条金额 ≤ 税款的记录将直接设为"税务"</div>`
+            : '';
+
+        const html = `
+            <div class="p-6">
+                <h3 class="text-lg font-bold text-white mb-2">智能拆分建议</h3>
+                <div class="text-gray-400 text-sm mb-4">
+                    以下 <span class="text-torn-accent font-bold">${overTaxItems.length}</span> 条记录金额超过周税设置 (${Utils.formatMoney(taxAmount)})，建议拆分为税务 + 其他分类
+                </div>
+                ${directNote}
+                <div class="text-xs text-gray-500 mb-3">取消勾选的记录将直接设为"税务"分类（不拆分）</div>
+
+                <div class="space-y-2 max-h-60 overflow-y-auto mb-4" id="split-tax-list">
+                    ${rowHTML}
+                </div>
+
+                <div class="flex justify-end gap-2">
+                    <button class="btn btn-secondary" id="split-tax-cancel">取消</button>
+                    <button class="btn btn-primary" id="split-tax-confirm">确认拆分</button>
+                </div>
+            </div>
+        `;
+
+        Utils.showModal(html);
+
+        document.getElementById('split-tax-cancel')?.addEventListener('click', () => Utils.hideModal());
+
+        document.getElementById('split-tax-confirm')?.addEventListener('click', async () => {
+            let splitCount = 0;
+            let directCount = 0;
+
+            for (const tx of overTaxItems) {
+                const cb = document.querySelector(`.split-tax-cb[data-tx-id="${tx.id}"]`);
+                if (cb && cb.checked) {
+                    // Split: delete original, create tax + remainder records
+                    const row = cb.closest('.flex.items-center.gap-3');
+                    const remainingCat = row?.querySelector('.split-remainder-cat')?.value || 'train';
+                    const remaining = tx.amount - taxAmount;
+
+                    await DB.delete('transactions', tx.id);
+
+                    await DB.put('transactions', {
+                        player_id: tx.player_id,
+                        player_name: tx.player_name,
+                        date: tx.date,
+                        timestamp: Date.now(),
+                        amount: taxAmount,
+                        category: 'tax',
+                        note: (tx.note ? tx.note + ' | ' : '') + `批量拆分: 税务部分 (原ID:${tx.id})`,
+                        split_from: tx.id
+                    });
+
+                    await DB.put('transactions', {
+                        player_id: tx.player_id,
+                        player_name: tx.player_name,
+                        date: tx.date,
+                        timestamp: Date.now(),
+                        amount: remaining,
+                        category: remainingCat,
+                        note: (tx.note ? tx.note + ' | ' : '') + `批量拆分: 剩余部分 (原ID:${tx.id})`,
+                        split_from: tx.id
+                    });
+
+                    splitCount++;
+                } else {
+                    // Not split: directly set to tax
+                    tx.category = 'tax';
+                    await DB.put('transactions', tx);
+                    directCount++;
+                }
+            }
+
+            // Process directTaxItems (amount <= taxAmount)
+            for (const tx of directTaxItems) {
+                tx.category = 'tax';
+                await DB.put('transactions', tx);
+                directCount++;
+            }
+
+            Utils.toast(`已拆分 ${splitCount} 条, 直接设税 ${directCount} 条`, 'success');
+            Utils.hideModal();
+            await this.render();
+        });
+    },
+
     // ---- Modals ----
 
     _showAddTransactionModal() {
@@ -558,7 +753,6 @@ window.FinancePage = {
                         <select class="input" id="modal-tx-cat">
                             <option value="train">训练 (train)</option>
                             <option value="tax">税务 (tax)</option>
-                            <option value="boost">加成 (boost)</option>
                             <option value="other">其他 (other)</option>
                         </select>
                     </div>
@@ -614,7 +808,6 @@ window.FinancePage = {
                         <select class="input" id="modal-edit-cat">
                             <option value="train" ${tx.category === 'train' ? 'selected' : ''}>训练 (train)</option>
                             <option value="tax" ${tx.category === 'tax' ? 'selected' : ''}>税务 (tax)</option>
-                            <option value="boost" ${tx.category === 'boost' ? 'selected' : ''}>加成 (boost)</option>
                             <option value="other" ${tx.category === 'other' ? 'selected' : ''}>其他 (other)</option>
                         </select>
                     </div>
@@ -769,7 +962,6 @@ window.FinancePage = {
                     <select class="input input-sm split-cat">
                         <option value="train">train</option>
                         <option value="tax">tax</option>
-                        <option value="boost">boost</option>
                         <option value="other">other</option>
                     </select>
                 </div>

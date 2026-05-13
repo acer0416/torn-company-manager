@@ -26,10 +26,12 @@ const Utils = {
     return new Date(ts * 1000).toLocaleDateString('zh-CN');
   },
 
-  // Unix timestamp to local datetime
+  // Unix timestamp to local datetime (accepts seconds or milliseconds)
   formatDateTime(ts) {
     if (!ts) return '-';
-    return new Date(ts * 1000).toLocaleString('zh-CN');
+    // Normalize: if < 1e11 (year 1973), assume seconds → convert to ms
+    if (ts < 100000000000) ts *= 1000;
+    return new Date(ts).toLocaleString('zh-CN');
   },
 
   // Relative time (e.g., "3天前")
