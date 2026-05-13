@@ -62,7 +62,8 @@ const TornAPI = {
   async v2(path) {
     const key = await this.getKey();
     if (!key) throw new Error('API key not set');
-    const url = `${this.BASE_V2}${path}?key=${key}`;
+    const separator = path.includes('?') ? '&' : '?';
+    const url = `${this.BASE_V2}${path}${separator}key=${key}`;
     return this._fetch(url);
   },
 

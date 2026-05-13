@@ -1,6 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Torn Company Manager",
+  "default_locale": "zh_CN",
   "version": "1.0.0",
   "description": "Torn City 公司管理工具 - 员工、训练、库存、财务、毒瘾监控、Boost管理",
   "permissions": [
@@ -19,6 +20,7 @@
     }
   },
   "action": {
+    "default_popup": "popup/index.html",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
@@ -26,7 +28,7 @@
     }
   },
   "background": {
-    "scripts": ["background/service-worker.js"]
+    "service_worker": "background/service-worker.js"
   },
   "icons": {
     "16": "icons/icon16.png",

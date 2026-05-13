@@ -863,7 +863,7 @@ window.FinancePage = {
                 const data = await TornAPI.v1('items', 'torn');
                 if (data && data.items) {
                     for (const [id, info] of Object.entries(data.items)) {
-                        this.itemNameCache[id] = info.name;
+                        this.itemNameCache[id] = { name: info.name, value: info.market_value || 0 };
                     }
                 }
             } catch (e2) {
@@ -896,10 +896,14 @@ window.FinancePage = {
             const existingLogIds = new Set(this.transactions.map(t => String(t.log_id)).filter(id => id && id !== 'undefined'));
             const allRelevant = [];
 
+            const currentEmployeeIds = new Set(this.employees.map(e => String(e.player_id)));
+
             // V2 log batches - each batch max 10 log type IDs
             const batches = [
-                '4800,4810,4102,4103,6284',           // money + items + company deposit
-                '4400,4401,4431,4440,4441,4445,4446,4480,4482,4430' // trades
+                '4800,4810,4815,4820,6284',           // money + company deposit
+                '4100,4101,4102,4103,4104,4105,4120,4121,4122,4123', // items
+                '4400,4401,4406,4410,4420,4430,4431,4440,4441,4445', // trades 1 (added 4420: Trade expire)
+                '4446,4447,4448,4449,4450,4451,4452,4480,4482'      // trades 2
             ];
 
             for (const batch of batches) {
@@ -916,15 +920,21 @@ window.FinancePage = {
 
                         // Extract player ID from data
                         const d = entry.data || {};
-                        const empId = d.user || d.sender || d.receiver || 0;
+                        // V2 logs can use user, sender, receiver, or even target in some cases
+                        const empId = d.user || d.sender || d.receiver || d.target || 0;
+                        const empIdStr = String(empId);
 
-                        allRelevant.push({
-                            log_id: logId,
-                            entry: entry,
-                            empName: '交易对方',
-                            empId: empId,
-                            isTrade: isTrade
-                        });
+                        // Only include logs related to current employees
+                        if (empIdStr !== '0' && currentEmployeeIds.has(empIdStr)) {
+                            const emp = this.employees.find(e => String(e.player_id) === empIdStr);
+                            allRelevant.push({
+                                log_id: logId,
+                                entry: entry,
+                                empName: emp ? emp.name : '员工',
+                                empId: empId,
+                                isTrade: isTrade
+                            });
+                        }
                     }
                 } catch (e) {
                     console.warn('[FinancePage] V2 log batch failed:', e);
@@ -956,6 +966,10 @@ window.FinancePage = {
                             <option value="month">本月</option>
                             <option value="all">全部时间</option>
                         </select>
+                        <select id="modal-ad-filter-emp" class="input input-sm shrink-0 truncate" style="max-width: 120px;">
+                            <option value="">全部员工</option>
+                            ${this.employees.map(e => `<option value="${e.player_id}">${e.name}</option>`).join('')}
+                        </select>
                         <div class="flex items-center gap-2 ml-auto mr-2 whitespace-nowrap shrink-0">
                             <input type="checkbox" id="modal-ad-select-all" class="cursor-pointer" checked />
                             <label for="modal-ad-select-all" class="text-sm text-gray-300 cursor-pointer">全选</label>
@@ -976,6 +990,11 @@ window.FinancePage = {
 
             document.getElementById('modal-ad-filter-time')?.addEventListener('change', (e) => {
                 this.adFilterTime = e.target.value;
+                this._renderAutoDetectList();
+            });
+
+            document.getElementById('modal-ad-filter-emp')?.addEventListener('change', (e) => {
+                this.adFilterEmp = e.target.value;
                 this._renderAutoDetectList();
             });
 
@@ -1065,11 +1084,21 @@ window.FinancePage = {
             }
         }
 
-        // Group trade entries by parsed_trade_id
+        // Group trade entries by trade ID
         const byTradeId = {};
         for (const item of tradeEntries) {
-            const tradeId = item.entry?.data?.parsed_trade_id;
-            if (!tradeId) { nonTrade.push(item); continue; }
+            // Try both parsed_trade_id and trade_id
+            let tradeId = item.entry?.data?.parsed_trade_id || item.entry?.data?.trade_id;
+            // If trade_id is a string with HTML (common in some API responses), extract the numeric ID
+            if (typeof tradeId === 'string' && tradeId.includes('ID=')) {
+                const match = tradeId.match(/ID=(\d+)/);
+                if (match) tradeId = match[1];
+            }
+
+            if (!tradeId) {
+                // Skip orphaned trade logs that don't have a trade ID
+                continue;
+            }
             if (!byTradeId[tradeId]) byTradeId[tradeId] = [];
             byTradeId[tradeId].push(item);
         }
@@ -1078,9 +1107,16 @@ window.FinancePage = {
         for (const [tradeId, steps] of Object.entries(byTradeId)) {
             steps.sort((a, b) => (a.entry.timestamp || 0) - (b.entry.timestamp || 0));
 
-            // Completed trade: any step has 'total' field
+            // Only include completed trades: must have 'total' field AND not expired/cancelled
             const hasTotal = steps.some(s => s.entry?.data?.total !== undefined);
             if (!hasTotal) continue;
+
+            // Skip trades that ended in expire (4420) or cancel (4410)
+            const isExpiredOrCancelled = steps.some(s => {
+                const logType = s.entry?.details?.id || 0;
+                return logType === 4410 || logType === 4420;
+            });
+            if (isExpiredOrCancelled) continue;
 
             // Aggregate money and items from all steps
             let totalMoney = 0;
@@ -1108,7 +1144,7 @@ window.FinancePage = {
                     _finalMoney: totalMoney,
                     _finalItems: Object.values(merged)
                 },
-                empName: '交易对方',
+                empName: this.employees.find(e => String(e.player_id) === String(traderUser))?.name || '交易对方',
                 empId: traderUser,
                 isTrade: true
             });
@@ -1164,7 +1200,7 @@ window.FinancePage = {
                 <input type="checkbox" class="log-entry-cb" data-idx="${item.idx}" checked />
                 <div class="flex-1">
                     <div class="text-white text-sm">
-                        <span class="text-torn-gold mr-1">[${item.empName}]</span>${item.entry.title || '日志条目'}${getDetails(item.entry)}
+                        <span class="text-torn-gold mr-1">[${item.empName}]</span>${item.isTrade ? 'Trade' : (item.entry.title || item.entry.details?.title || '日志条目')}${getDetails(item.entry)}
                     </div>
                     <div class="text-gray-500 text-xs">${Utils.formatDateTime(item.entry.timestamp)}</div>
                 </div>
