@@ -679,6 +679,7 @@ window.FinancePage = {
                     const row = cb.closest('.flex.items-center.gap-3');
                     const remainingCat = row?.querySelector('.split-remainder-cat')?.value || 'train';
                     const remaining = tx.amount - taxAmount;
+                    const originalLogId = tx.log_id;
 
                     await DB.delete('transactions', tx.id);
 
@@ -689,8 +690,9 @@ window.FinancePage = {
                         timestamp: Date.now(),
                         amount: taxAmount,
                         category: 'tax',
-                        note: (tx.note ? tx.note + ' | ' : '') + `批量拆分: 税务部分 (原ID:${tx.id})`,
-                        split_from: tx.id
+                        note: (tx.note ? tx.note + ' | ' : '') + `税务部分 | 拆分自 ${Utils.formatDateTime(tx.timestamp)} (${Utils.formatMoney(tx.amount)})`,
+                        split_from: tx.id,
+                        log_id: originalLogId
                     });
 
                     await DB.put('transactions', {
@@ -700,8 +702,9 @@ window.FinancePage = {
                         timestamp: Date.now(),
                         amount: remaining,
                         category: remainingCat,
-                        note: (tx.note ? tx.note + ' | ' : '') + `批量拆分: 剩余部分 (原ID:${tx.id})`,
-                        split_from: tx.id
+                        note: (tx.note ? tx.note + ' | ' : '') + `剩余部分 | 拆分自 ${Utils.formatDateTime(tx.timestamp)} (${Utils.formatMoney(tx.amount)})`,
+                        split_from: tx.id,
+                        log_id: originalLogId
                     });
 
                     splitCount++;
@@ -923,6 +926,7 @@ window.FinancePage = {
             }
 
             // Delete original
+            const originalLogId = tx.log_id;
             await DB.delete('transactions', tx.id);
 
             // Add split parts
@@ -936,7 +940,8 @@ window.FinancePage = {
                         amount: amounts[i],
                         category: cats[i] || 'other',
                         note: notes[i] || `拆分自 ${Utils.formatDateTime(tx.timestamp)} (${Utils.formatMoney(tx.amount)})`,
-                        split_from: tx.id
+                        split_from: tx.id,
+                        log_id: originalLogId
                     });
                 }
             }
