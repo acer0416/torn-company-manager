@@ -152,7 +152,7 @@ async function recordRehabEvent(playerId, playerName) {
 // IndexedDB helper for service worker
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('torn-company-manager', 3);
+    const req = indexedDB.open('torn-company-manager', 5);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });

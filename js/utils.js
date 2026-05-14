@@ -56,12 +56,58 @@ const Utils = {
     return new Date().toISOString().slice(0, 10);
   },
 
-  // Get week key (YYYY-Wnn)
-  weekKey() {
-    const d = new Date();
+  // Get week key (YYYY-Wnn). If date is provided, calculate for that date; otherwise use today.
+  weekKey(date) {
+    const d = date || new Date();
     const jan1 = new Date(d.getFullYear(), 0, 1);
     const week = Math.ceil(((d - jan1) / 86400000 + jan1.getDay() + 1) / 7);
     return d.getFullYear() + '-W' + String(week).padStart(2, '0');
+  },
+
+  // Get date range from week key (exact inverse of weekKey)
+  weekDateRange(weekKey) {
+    const parts = weekKey.split('-W');
+    const year = parseInt(parts[0], 10);
+    const weekNum = parseInt(parts[1], 10);
+    const jan1 = new Date(year, 0, 1);
+    const jan1Day = jan1.getDay();
+    // Derivation from weekKey: ceil((days + jan1Day + 1) / 7) = W
+    // → 7*(W-1) - jan1Day ≤ days ≤ 7*W - 1 - jan1Day
+    const startDayOfYear = 7 * (weekNum - 1) - jan1Day;
+    const endDayOfYear = 7 * weekNum - 1 - jan1Day;
+    const start = new Date(year, 0, 1 + startDayOfYear);
+    const end = new Date(year, 0, 1 + endDayOfYear);
+    return { start: start, end: end };
+  },
+
+  // Human-readable week label: "2026年5月11日 - 17日 (第20周)"
+  weekLabel(weekKey) {
+    const range = this.weekDateRange(weekKey);
+    const parts = weekKey.split('-W');
+    const weekNum = parseInt(parts[1], 10);
+    const year = parseInt(parts[0], 10);
+    const startMonth = range.start.getMonth() + 1;
+    const startDay = range.start.getDate();
+    const endMonth = range.end.getMonth() + 1;
+    const endDay = range.end.getDate();
+    return year + '年' + startMonth + '月' + startDay + '日 - ' + endDay + '日 (第' + weekNum + '周)';
+  },
+
+  // Get count of currently active employees from IndexedDB
+  async getEmployeeCount() {
+    try {
+      const all = await DB.getAll('employees_master');
+      if (!all || !all.length) return 0;
+      return all.filter(emp => !emp.left_date).length;
+    } catch (e) {
+      console.error('getEmployeeCount error:', e);
+      return 0;
+    }
+  },
+
+  // Format currency without decimals ($1,234)
+  formatCurrency(amount) {
+    return '$' + Number(amount).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
   },
 
   // Debounce

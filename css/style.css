@@ -130,6 +130,39 @@ body, .bg-torn-bg, .bg-torn-card, .bg-torn-surface {
   font-size: 0.625rem;
 }
 
+/* Tax transaction row grid — fixed column widths for alignment */
+.tax-tx-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 0.6fr) 100px 220px minmax(0, 1.5fr);
+  gap: 8px;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid #374151;
+  font-size: 0.75rem;
+}
+.tax-tx-col {
+  min-width: 0;
+  overflow: hidden;
+}
+.tax-tx-col-cb {
+  display: flex;
+  justify-content: center;
+}
+.tax-tx-col-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.tax-tx-col-amount {
+  white-space: nowrap;
+}
+.tax-tx-col-week select {
+  font-size: 0.7rem;
+}
+.tax-tx-col-note {
+  overflow: hidden;
+}
+
 /* Buttons */
 .btn {
   display: inline-flex;
@@ -305,4 +338,156 @@ select.input {
 @media (max-width: 768px) {
   aside { display: none; }
   main { padding: 1rem; }
+}
+
+/* ===== 员工纳税明细 ===== */
+.emp-tax-section {
+  margin-top: 1rem;
+}
+
+.emp-tax-header {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 100px 100px 100px 80px 80px;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #8b8b9e;
+  border-bottom: 1px solid #2a2a4a;
+}
+
+.emp-tax-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 100px 100px 100px 80px 80px;
+  padding: 0.6rem 0.75rem;
+  align-items: center;
+  border-left: 3px solid transparent;
+  border-bottom: 1px solid rgba(42, 42, 74, 0.4);
+  transition: background-color 0.2s;
+  font-size: 0.8rem;
+}
+
+.emp-tax-row:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.emp-tax-row-unpaid {
+  border-left-color: #e94560;
+  background: rgba(233, 69, 96, 0.08);
+}
+
+.emp-tax-row-partial {
+  border-left-color: #f0a500;
+  background: rgba(240, 165, 0, 0.08);
+}
+
+.emp-tax-row-writeoff {
+  border-left-color: #4a9eff;
+  background: rgba(74, 158, 255, 0.08);
+}
+
+.emp-tax-row-paid {
+  border-left-color: #2ecc71;
+}
+
+.emp-tax-col-dot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.status-dot-unpaid {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #e94560;
+}
+
+.status-dot-partial {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f0a500;
+}
+
+.status-dot-paid {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #2ecc71;
+}
+
+.status-dot-writeoff {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4a9eff;
+}
+
+.emp-tax-amount-editable {
+  cursor: pointer;
+  border-bottom: 1px dashed #4a9eff;
+  padding: 2px 4px;
+  border-radius: 3px;
+  transition: background 0.15s;
+}
+
+.emp-tax-amount-editable:hover {
+  background: rgba(74, 158, 255, 0.15);
+}
+
+.emp-tax-amount-input {
+  width: 90px;
+  padding: 2px 6px;
+  background: #0a0a1a;
+  border: 1px solid #4a9eff;
+  border-radius: 4px;
+  color: #e0e0e0;
+  font-size: 0.8rem;
+  text-align: right;
+}
+
+.emp-tax-status-badge {
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+
+.emp-tax-status-paid {
+  background: rgba(46, 204, 113, 0.15);
+  color: #2ecc71;
+}
+
+.emp-tax-status-unpaid {
+  background: rgba(233, 69, 96, 0.15);
+  color: #e94560;
+}
+
+.emp-tax-status-partial {
+  background: rgba(240, 165, 0, 0.15);
+  color: #f0a500;
+}
+
+.emp-tax-status-writeoff {
+  background: rgba(74, 158, 255, 0.15);
+  color: #4a9eff;
+}
+
+/* 员工税率管理模态框 */
+.emp-tax-rates-list {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.emp-tax-rate-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid #2a2a4a;
+}
+
+.emp-tax-rate-row:hover {
+  background: rgba(255, 255, 255, 0.02);
 }
