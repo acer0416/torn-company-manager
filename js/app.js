@@ -84,18 +84,18 @@
     window.location.hash = '#/settings';
     Utils.toast('请先设置 API Key', 'warning');
   } else {
-    // Load company info into header (non-blocking)
-    TornAPI.getCompanyProfile().then(profile => {
-      if (profile && profile.company) {
-        const companyName = profile.company.name || 'Unknown';
-        const rating = profile.company.rating || 0;
+    // Load company info into header (non-blocking) — 使用统一的 companyData 缓存储
+    AppCache.getOrFetch('companyData', () => TornAPI.getCompanyData()).then(data => {
+      if (data && data.profile) {
+        const companyName = data.profile.name || 'Unknown';
+        const rating = data.profile.rating || 0;
         document.getElementById('header-company-name').textContent = `${companyName} (${rating}⭐)`;
         document.getElementById('header-company').classList.remove('hidden');
         document.getElementById('header-status').classList.remove('hidden');
         console.log('[App] Company loaded:', companyName);
       }
     }).catch(err => {
-      console.warn('[App] Failed to load company profile:', err);
+      console.warn('[App] Failed to load company data:', err);
     });
   }
 
@@ -106,15 +106,22 @@
   document.getElementById('btn-refresh')?.addEventListener('click', async () => {
     Utils.showLoading('刷新中...');
     try {
-      const data = await TornAPI.getCompanyFull();
+      // 清除 companyData 缓存，强制重新获取（header 和刷新按钮统一使用 companyData）
+      AppCache.invalidate('companyData');
+      const data = await AppCache.getOrFetch('companyData', () => TornAPI.getCompanyData());
       const today = Utils.todayKey();
+      // 恢复 object 格式以兼容快照存储
+      const employees = {};
+      (data.employees || []).forEach(emp => { employees[emp.id || emp.player_id] = emp; });
+      const stock = {};
+      (data.stock || []).forEach(item => { stock[item.name] = item; });
       await DB.put('snapshots', {
         date: today,
         timestamp: Math.floor(Date.now() / 1000),
-        profile: data.company || {},
-        employees: data.company_employees || {},
-        stock: data.company_stock || {},
-        detailed: data.company_detailed || {}
+        profile: data.profile || {},
+        employees: employees,
+        stock: stock,
+        detailed: data.detailed || {}
       });
       Utils.toast('刷新成功', 'success');
       Router.refresh();

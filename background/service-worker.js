@@ -10,16 +10,14 @@ chrome.action.onClicked.addListener(() => {
 // Install handler
 chrome.runtime.onInstalled.addListener(() => {
   console.log('Torn Company Manager installed');
-  // Set default settings
-  chrome.storage.local.get('settings', (result) => {
-    if (!result.settings) {
+  // Set default settings (flat keys)
+  chrome.storage.local.get('monitoringEnabled', (result) => {
+    if (result.monitoringEnabled === undefined) {
       chrome.storage.local.set({
-        settings: {
-          rehabMonitorEnabled: true,
-          rehabCheckInterval: 30, // minutes
-          notificationsEnabled: true,
-          autoRefreshInterval: 60, // minutes
-        }
+        monitoringEnabled: true,
+        checkInterval: 30, // minutes
+        notificationsEnabled: true,
+        refreshInterval: 60  // minutes
       });
     }
   });
@@ -43,21 +41,24 @@ chrome.runtime.onStartup.addListener(() => {
 setupAlarms();
 
 async function setupAlarms() {
-  const { settings } = await chrome.storage.local.get('settings');
-  if (!settings) return;
+  const items = await chrome.storage.local.get([
+    'monitoringEnabled',
+    'checkInterval',
+    'refreshInterval'
+  ]);
 
   // Clear existing alarms
   await chrome.alarms.clearAll();
 
-  if (settings.rehabMonitorEnabled) {
+  if (items.monitoringEnabled) {
     chrome.alarms.create('rehab-monitor', {
-      periodInMinutes: settings.rehabCheckInterval || 30
+      periodInMinutes: items.checkInterval || 30
     });
   }
 
-  if (settings.autoRefreshInterval > 0) {
+  if (items.refreshInterval > 0) {
     chrome.alarms.create('auto-refresh', {
-      periodInMinutes: settings.autoRefreshInterval || 60
+      periodInMinutes: items.refreshInterval || 60
     });
   }
 }
@@ -121,26 +122,27 @@ async function checkRehabStatus() {
 }
 
 // Record a rehab event in IndexedDB (same store as the rehab page reads)
+// 去重策略：player_id + date 联合检查（与 rehab.js 保持一致）
 async function recordRehabEvent(playerId, playerName) {
   const today = new Date().toISOString().slice(0, 10);
   const db = await openDB();
   const tx = db.transaction('rehab_records', 'readwrite');
   const store = tx.objectStore('rehab_records');
 
-  // Check if we already recorded this trip today
+  // 使用 player_id 索引获取该玩家所有记录，再按日期去重
   const existing = await new Promise((resolve) => {
-    const req = store.index('date').getAll(today);
+    const req = store.index('player_id').getAll(playerId);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => resolve([]);
   });
 
-  const alreadyRecorded = existing.some(r => r.player_id === playerId);
+  const alreadyRecorded = existing.some(r => r.date === today);
   if (!alreadyRecorded) {
     store.put({
       player_id: playerId,
       player_name: playerName,
       date: today,
-      timestamp: Math.floor(Date.now() / 1000),
+      timestamp: Date.now(),
       auto_detected: true
     });
     await new Promise((resolve) => { tx.oncomplete = resolve; tx.onerror = resolve; });
@@ -152,7 +154,7 @@ async function recordRehabEvent(playerId, playerName) {
 // IndexedDB helper for service worker
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('torn-company-manager', 5);
+    const req = indexedDB.open('torn-company-manager', 6);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -160,23 +162,23 @@ function openDB() {
 
 // Auto-refresh company data snapshot (writes to IndexedDB)
 async function refreshCompanyData() {
-  const { apiKey } = await chrome.storage.local.get('apiKey');
-  if (!apiKey) return;
+const { apiKey } = await chrome.storage.local.get('apiKey');
+if (!apiKey) return;
 
-  try {
-    const resp = await fetch(`https://api.torn.com/company/?selections=profile,employees,stock,detailed&key=${apiKey}`);
-    const data = await resp.json();
-    if (data.error) return;
+try {
+  const resp = await fetch(`https://api.torn.com/company/?selections=profile,employees,stock,detailed&key=${apiKey}`);
+  const data = await resp.json();
+  if (data.error) return;
 
-    const today = new Date().toISOString().slice(0, 10);
-    const snapshot = {
-      date: today,
-      timestamp: Math.floor(Date.now() / 1000),
-      profile: data.company || {},
-      employees: data.company_employees || {},
-      stock: data.company_stock || {},
-      detailed: data.company_detailed || {}
-    };
+  const today = new Date().toISOString().slice(0, 10);
+  const snapshot = {
+    date: today,
+    timestamp: Date.now(),
+    profile: data.company || {},
+    employees: data.company_employees || {},
+    stock: data.company_stock || {},
+    detailed: data.company_detailed || {}
+  };
 
     // Write to IndexedDB (same store the dashboard reads from)
     const db = await openDB();

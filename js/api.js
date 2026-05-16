@@ -94,5 +94,60 @@ const TornAPI = {
     }
   },
 
-  async getCompanyById(id) { return this.v1('profile', 'company', `id=${id}`); }
+  async getCompanyById(id) { return this.v1('profile', 'company', `id=${id}`); },
+
+  // --- 统一数据获取方法（屏蔽 V1/V2 差异）---
+
+  /** 始终返回 Employee[] 数组 */
+  async getEmployeesUnified() {
+    // 优先 V2（返回数组格式），回退 V1（返回 {id: {...}} 对象格式）
+    try {
+      const data = await this.v2('/company/employees');
+      const employees = data?.employees;
+      if (Array.isArray(employees) && employees.length > 0) return employees;
+      throw new Error('V2 returned empty/invalid employees');
+    } catch (e) {
+      console.log('[TornAPI] getEmployeesUnified: V2 failed, falling back to V1:', e.message);
+      const data = await this.v1('employees');
+      const employees = data?.company_employees;
+      if (!employees) throw new Error('No employees data from V1');
+      if (Array.isArray(employees)) return employees;
+      return Object.values(employees);
+    }
+  },
+
+  /** 始终返回 StockItem[] 数组 */
+  async getStockUnified() {
+    // 优先 V2（返回数组格式），回退 V1（返回 {name: {...}} 对象格式）
+    try {
+      const data = await this.v2('/company/stock');
+      const stock = data?.stock;
+      if (Array.isArray(stock) && stock.length > 0) return stock;
+      throw new Error('V2 returned empty/invalid stock');
+    } catch (e) {
+      console.log('[TornAPI] getStockUnified: V2 failed, falling back to V1:', e.message);
+      const data = await this.v1('stock');
+      const stock = data?.company_stock;
+      if (!stock) throw new Error('No stock data from V1');
+      if (Array.isArray(stock)) return stock;
+      return Object.entries(stock).map(([name, item]) => ({ name, ...item }));
+    }
+  },
+
+  /** 一次调用获取所有公司数据，返回标准化结构 */
+  async getCompanyData() {
+    const raw = await this.v1('profile,employees,stock,detailed');
+    return {
+      profile: raw?.company || {},
+      employees: raw?.company_employees
+        ? (Array.isArray(raw.company_employees)
+          ? raw.company_employees
+          : Object.entries(raw.company_employees).map(([id, emp]) => ({ id: Number(id), ...emp })))
+        : [],
+      stock: raw?.company_stock
+        ? (Array.isArray(raw.company_stock) ? raw.company_stock : Object.entries(raw.company_stock).map(([name, item]) => ({ name, ...item })))
+        : [],
+      detailed: raw?.company_detailed || {}
+    };
+  }
 };

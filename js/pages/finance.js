@@ -47,6 +47,9 @@ window.FinancePage = {
         Utils.showLoading('加载财务数据...');
         try {
             await this._loadData();
+            // 确保 tax_weeks 基于最新的员工数据和税务配置重新计算
+            await this._ensureWeekExists(this.selectedWeekKey);
+            await this._recalculateWeek(this.selectedWeekKey);
             Utils.hideLoading();
             c.innerHTML = this._buildHTML();
             this._bindEvents();
@@ -69,11 +72,35 @@ window.FinancePage = {
     },
 
     async _loadData() {
-        // Load tax config
-        const taxAmt = await DB.get('training_config', 'weekly_tax_amount');
-        this.config.weekly_tax_amount = taxAmt?.value ?? 0;
-        const taxEnabled = await DB.get('training_config', 'weekly_tax_enabled');
-        this.config.weekly_tax_enabled = taxEnabled?.value ?? true;
+        // Load tax config (from tax_config store, with migration from training_config)
+        try {
+            var taxAmt = await DB.get('tax_config', 'weekly_tax_amount');
+            if (!taxAmt) {
+                // 迁移：从 training_config 读取旧值
+                taxAmt = await DB.get('training_config', 'weekly_tax_amount');
+                if (taxAmt) {
+                    await DB.put('tax_config', { key: 'weekly_tax_amount', value: taxAmt.value });
+                    await DB.delete('training_config', 'weekly_tax_amount');
+                }
+            }
+            this.config.weekly_tax_amount = taxAmt?.value ?? 0;
+
+            var taxEnabled = await DB.get('tax_config', 'weekly_tax_enabled');
+            if (!taxEnabled) {
+                taxEnabled = await DB.get('training_config', 'weekly_tax_enabled');
+                if (taxEnabled) {
+                    await DB.put('tax_config', { key: 'weekly_tax_enabled', value: taxEnabled.value });
+                    await DB.delete('training_config', 'weekly_tax_enabled');
+                }
+            }
+            this.config.weekly_tax_enabled = taxEnabled?.value ?? true;
+        } catch (e) {
+            // 回退：直接读取 training_config
+            const taxAmtFallback = await DB.get('training_config', 'weekly_tax_amount');
+            this.config.weekly_tax_amount = taxAmtFallback?.value ?? 0;
+            const taxEnabledFallback = await DB.get('training_config', 'weekly_tax_enabled');
+            this.config.weekly_tax_enabled = taxEnabledFallback?.value ?? true;
+        }
 
         // Load all transactions
         this.transactions = (await DB.getAll('transactions')) || [];
@@ -82,27 +109,72 @@ window.FinancePage = {
         this.employeeTaxList = await DB.getAll('employee_tax') || [];
         this.employeeTaxRates = await DB.getAll('employee_tax_rates') || [];
 
-        // Load employees from employees_master DB
+        // 重置员工列表，防止 _loadData() 被多次调用时累积重复数据
+        this.employees = [];
+
+        // Load employees from employees_master DB (统一使用 Number 类型的 player_id)
         try {
             const masterEmployees = await DB.getAll('employees_master');
             if (masterEmployees && masterEmployees.length) {
-                this.employees = masterEmployees;
-                return;
+                // 过滤/修正混合 keyType 残留：只保留 Number 类型的 player_id
+                const dedupMap = new Map();
+                for (const emp of masterEmployees) {
+                    const pid = Number(emp.player_id);
+                    if (!pid) continue;
+                    // 保留最新的一条（last_seen 最大的），覆盖 string key 残留
+                    const existing = dedupMap.get(pid);
+                    if (!existing || (emp.last_seen || '') > (existing.last_seen || '')) {
+                        dedupMap.set(pid, { ...emp, player_id: pid });
+                    }
+                }
+                this.employees = Array.from(dedupMap.values());
             }
         } catch (e) { /* fallback */ }
 
-        // Fallback: fetch from API
-        try {
-            const data = await TornAPI.getCompanyEmployees();
-            this.employees = Object.entries(data.employees || data).map(([id, e]) => ({
-                player_id: String(id),
-                name: e.name || `ID:${id}`,
-                position: e.position?.name || e.position || 'N/A',
-                ...e
-            }));
-        } catch (e) {
-            this.employees = [];
+        // 补充或回退：使用缓存 + 统一 API 获取最新员工数据
+        let apiEmployees = AppCache.get('employees');
+        if (!apiEmployees) {
+            try {
+                apiEmployees = await AppCache.getOrFetch('employees', () => TornAPI.getEmployeesUnified());
+            } catch (e) {
+                apiEmployees = [];
+            }
         }
+
+        // 用 API 数据补充/更新 employees 列表（保留 employees_master 中已离职员工信息）
+        // 统一使用 Number 类型的 player_id 作为 key
+        const masterMap = new Map();
+        (this.employees || []).forEach(emp => masterMap.set(Number(emp.player_id), emp));
+
+        for (const emp of (apiEmployees || [])) {
+            const pid = Number(emp.id || emp.player_id);
+            if (!pid) continue;
+            if (masterMap.has(pid)) {
+                // 更新活跃员工的最新信息
+                const existing = masterMap.get(pid);
+                existing.name = emp.name || existing.name;
+                existing.position = emp.position?.name || emp.position || existing.position;
+                existing.status = emp.status || existing.status;
+                existing.effectiveness = emp.effectiveness || existing.effectiveness;
+                existing.player_id = pid; // 确保 player_id 为 Number 类型
+                // 保留 employees_master 的特有字段（first_seen, last_seen, left_date）
+            } else {
+                // 新员工：加入列表
+                this.employees.push({
+                    player_id: pid,
+                    name: emp.name || `ID:${pid}`,
+                    position: emp.position?.name || emp.position || 'N/A',
+                    first_seen: Utils.todayKey(),
+                    last_seen: Utils.todayKey(),
+                    left_date: null,
+                    status: emp.status || {},
+                    effectiveness: emp.effectiveness || {}
+                });
+            }
+        }
+
+        // 同步员工到 employees_master（幂等，不标记离职）
+        await Utils.syncEmployeesMaster(apiEmployees);
 
         // Load latest snapshot for API data
         try {
@@ -114,6 +186,18 @@ window.FinancePage = {
             }
         } catch (e) {
             this.latestSnapshot = null;
+        }
+
+        // 如果没有快照，直接从 API 获取公司详细数据（确保概览 Tab 首次打开即显示数据）
+        if (!this.latestSnapshot) {
+            try {
+                const detail = await AppCache.getOrFetch('companyDetailed', () => TornAPI.getCompanyDetailed());
+                if (detail?.company_detailed) {
+                    this.latestSnapshot = { detailed: detail.company_detailed };
+                }
+            } catch (e) {
+                console.warn('[FinancePage] Failed to fetch company detailed:', e);
+            }
         }
     },
 
@@ -191,35 +275,10 @@ window.FinancePage = {
         var balance = taxPaid - netDue;
         
         // 计算结转输出（超额部分自动结转至下周）
+        // 注意：实际 carryover 记录在员工级别重算后创建，以便附带 per_employee_surplus
         var carryoverOut = 0;
         if (balance > 0 && weekKey !== Utils.weekKey()) {
-            // 仅当有结余且非当前周时，自动结转
             carryoverOut = balance;
-            
-            // 检查是否已有结转记录
-            var existingCarryover = this.taxCarryovers.find(function(c) {
-                return c.from_week_key === weekKey && !c.deleted;
-            });
-            
-            if (!existingCarryover && carryoverOut > 0) {
-                // 计算下一周的 key
-                var range = Utils.weekDateRange(weekKey);
-                var nextWeekDay = new Date(range.end.getTime() + 24 * 60 * 60 * 1000);
-                var nextWeekKey = Utils.weekKey(nextWeekDay);
-                
-                var carryoverRecord = {
-                    from_week_key: weekKey,
-                    to_week_key: nextWeekKey,
-                    amount: carryoverOut,
-                    type: 'auto',
-                    created_at: Date.now(),
-                    note: '自动结转：' + Utils.weekLabel(weekKey) + ' 超额 → ' + Utils.weekLabel(nextWeekKey),
-                    deleted: false
-                };
-                
-                await DB.put('tax_carryover', carryoverRecord);
-                this.taxCarryovers.push(carryoverRecord);
-            }
         }
         
         // 确定状态
@@ -267,6 +326,26 @@ window.FinancePage = {
                 paidByEmployee[pid] = { paid: 0, name: tx.player_name || '' };
             }
             paidByEmployee[pid].paid += Number(tx.amount) || 0;
+        }
+
+        // --- 分配结转转入到员工级别 ---
+        // 从上一周的结转记录中提取 per_employee_surplus 并加到当前周每位员工的实缴中
+        var incomingCarryovers = this.taxCarryovers.filter(function(c) {
+            return c.to_week_key === weekKey && !c.deleted;
+        });
+        for (var ci = 0; ci < incomingCarryovers.length; ci++) {
+            var ic = incomingCarryovers[ci];
+            var surplusMap = ic.per_employee_surplus;
+            if (surplusMap && typeof surplusMap === 'object') {
+                for (var spid in surplusMap) {
+                    if (surplusMap.hasOwnProperty(spid)) {
+                        if (!paidByEmployee[spid]) {
+                            paidByEmployee[spid] = { paid: 0, name: '' };
+                        }
+                        paidByEmployee[spid].paid += Number(surplusMap[spid]) || 0;
+                    }
+                }
+            }
         }
 
         // 获取活跃员工列表
@@ -324,6 +403,53 @@ window.FinancePage = {
             });
         }
 
+        // --- 构建 per_employee_surplus 并创建/更新自动结转记录 ---
+        if (carryoverOut > 0) {
+            // 计算每位员工在缴纳应缴后还有多少盈余（= paid - taxAmount，仅正值）
+            var perEmployeeSurplus = {};
+            var allIdsArr2 = Array.from(allEmployeeIds);
+            for (var es = 0; es < allIdsArr2.length; es++) {
+                var spid = allIdsArr2[es];
+                var spaid = paidByEmployee[spid] ? paidByEmployee[spid].paid : 0;
+                var sTaxAmount = self._getEmployeeTaxRate(spid);
+                var surplus = Math.max(0, spaid - sTaxAmount);
+                if (surplus > 0) {
+                    perEmployeeSurplus[spid] = surplus;
+                }
+            }
+
+            // 计算下一周的 key
+            var coRange = Utils.weekDateRange(weekKey);
+            var coNextWeekDay = new Date(coRange.end.getTime() + 24 * 60 * 60 * 1000);
+            var coNextWeekKey = Utils.weekKey(coNextWeekDay);
+
+            var existingCarryover = self.taxCarryovers.find(function(c) {
+                return c.from_week_key === weekKey && !c.deleted;
+            });
+
+            if (existingCarryover) {
+                existingCarryover.amount = carryoverOut;
+                existingCarryover.per_employee_surplus = perEmployeeSurplus;
+                existingCarryover.to_week_key = coNextWeekKey;
+                existingCarryover.updated_at = Date.now();
+                existingCarryover.note = '更新自动结转（含员工明细）：' + Utils.weekLabel(weekKey) + ' 超额 → ' + Utils.weekLabel(coNextWeekKey);
+                await DB.put('tax_carryover', existingCarryover);
+            } else {
+                var carryoverRecord = {
+                    from_week_key: weekKey,
+                    to_week_key: coNextWeekKey,
+                    amount: carryoverOut,
+                    per_employee_surplus: perEmployeeSurplus,
+                    type: 'auto',
+                    created_at: Date.now(),
+                    note: '自动结转（含员工明细）：' + Utils.weekLabel(weekKey) + ' 超额 → ' + Utils.weekLabel(coNextWeekKey),
+                    deleted: false
+                };
+                await DB.put('tax_carryover', carryoverRecord);
+                self.taxCarryovers.push(carryoverRecord);
+            }
+        }
+
         // 刷新内存中的 employeeTaxList
         self.employeeTaxList = await DB.getAll('employee_tax') || [];
 
@@ -379,6 +505,21 @@ window.FinancePage = {
         var nextWeekDay = new Date(range.end.getTime() + 24 * 60 * 60 * 1000);
         var nextWeekKey = Utils.weekKey(nextWeekDay);
         
+        // 从 employee_tax 计算 per_employee_surplus
+        var empTaxRecords = this.employeeTaxList.filter(function(r) {
+            return r.week_key === weekKey;
+        });
+        var perEmployeeSurplus = {};
+        for (var eti = 0; eti < empTaxRecords.length; eti++) {
+            var etr = empTaxRecords[eti];
+            var etPaid = Number(etr.paid_amount) || 0;
+            var etTaxAmt = Number(etr.tax_amount) || 0;
+            var etSurplus = Math.max(0, etPaid - etTaxAmt);
+            if (etSurplus > 0) {
+                perEmployeeSurplus[String(etr.player_id)] = etSurplus;
+            }
+        }
+        
         // 检查是否已有结转
         var existingCarryover = this.taxCarryovers.find(function(c) {
             return c.from_week_key === weekKey && !c.deleted;
@@ -387,6 +528,7 @@ window.FinancePage = {
         if (existingCarryover) {
             // 更新金额
             existingCarryover.amount = balance;
+            existingCarryover.per_employee_surplus = perEmployeeSurplus;
             existingCarryover.updated_at = Date.now();
             existingCarryover.note = '更新结转：' + Utils.weekLabel(weekKey) + ' 超额 → ' + Utils.weekLabel(nextWeekKey);
             await DB.put('tax_carryover', existingCarryover);
@@ -396,6 +538,7 @@ window.FinancePage = {
                 from_week_key: weekKey,
                 to_week_key: nextWeekKey,
                 amount: balance,
+                per_employee_surplus: perEmployeeSurplus,
                 type: 'manual',
                 created_at: Date.now(),
                 note: '手动结转：' + Utils.weekLabel(weekKey) + ' 超额 → ' + Utils.weekLabel(nextWeekKey),
@@ -1549,7 +1692,9 @@ window.FinancePage = {
     async _saveTaxConfig() {
         const amount = Utils.parseMoneyInput(document.getElementById('cfg-weekly-tax')?.value);
         this.config.weekly_tax_amount = amount;
-        await DB.put('training_config', { key: 'weekly_tax_amount', value: amount });
+        try {
+            await DB.put('tax_config', { key: 'weekly_tax_amount', value: amount });
+        } catch (e) { /* ignore */ }
         Utils.toast('税务配置已保存', 'success');
         await this._cascadeRecalculate(this.selectedWeekKey);
     },

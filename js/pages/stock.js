@@ -49,46 +49,11 @@ window.StockPage = {
   },
 
   async _loadData() {
-    let loaded = false;
-
-    // Try V2 first (array format)
+    // 使用缓存 + 统一 API（内部处理 V1/V2 回退）
     try {
-      console.log('[StockPage] Trying V2 getCompanyStock...');
-      const v2Data = await TornAPI.getCompanyStock();
-      console.log('[StockPage] V2 response:', v2Data);
-      if (v2Data && Array.isArray(v2Data.stock) && v2Data.stock.length > 0) {
-        this._stockData = v2Data.stock;
-        loaded = true;
-        console.log('[StockPage] V2 loaded', this._stockData.length, 'items');
-      } else {
-        console.log('[StockPage] V2 returned empty/invalid stock array, falling back to V1');
-      }
+      this._stockData = await AppCache.getOrFetch('stock', () => TornAPI.getStockUnified());
     } catch (e) {
-      console.log('[StockPage] V2 failed:', e.message);
-    }
-
-    // Fallback to V1 (keyed-by-name format)
-    if (!loaded) {
-      try {
-        console.log('[StockPage] Trying V1 getCompanyFull...');
-        const v1Data = await TornAPI.getCompanyFull();
-        console.log('[StockPage] V1 response keys:', v1Data ? Object.keys(v1Data) : 'null');
-        if (v1Data && v1Data.company_stock && typeof v1Data.company_stock === 'object') {
-          this._stockData = Object.entries(v1Data.company_stock).map(([name, item]) => ({
-            name, ...item
-          }));
-          loaded = true;
-          console.log('[StockPage] V1 loaded', this._stockData.length, 'items');
-        } else {
-          console.log('[StockPage] V1 returned no company_stock data');
-        }
-      } catch (e) {
-        console.log('[StockPage] V1 also failed:', e.message);
-      }
-    }
-
-    if (!loaded) {
-      console.warn('[StockPage] Could not load stock data from V1 or V2');
+      console.warn('[StockPage] Failed to load stock data:', e.message);
       this._stockData = [];
     }
 

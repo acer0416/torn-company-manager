@@ -5,40 +5,86 @@ window.SettingsPage = {
     companyInfo: null,
 
     async init() {
+        await this._migrateOldNestedSettings();
         await this.loadSettings();
         await this.render();
     },
 
+    // 迁移旧嵌套结构 { settings: { rehabMonitorEnabled, ... } } 到扁平结构
+    async _migrateOldNestedSettings() {
+        try {
+            const result = await chrome.storage.local.get('settings');
+            if (result.settings && typeof result.settings === 'object') {
+                const flat = result.settings;
+                const newSettings = {};
+                if (flat.rehabMonitorEnabled !== undefined) {
+                    newSettings[SETTINGS_KEYS.MONITORING_ENABLED] = flat.rehabMonitorEnabled;
+                }
+                if (flat.rehabCheckInterval !== undefined) {
+                    newSettings[SETTINGS_KEYS.CHECK_INTERVAL] = flat.rehabCheckInterval;
+                }
+                if (flat.autoRefreshInterval !== undefined) {
+                    newSettings[SETTINGS_KEYS.REFRESH_INTERVAL] = flat.autoRefreshInterval;
+                }
+                if (flat.notificationsEnabled !== undefined) {
+                    newSettings[SETTINGS_KEYS.NOTIFICATIONS_ENABLED] = flat.notificationsEnabled;
+                }
+                if (Object.keys(newSettings).length > 0) {
+                    await chrome.storage.local.set(newSettings);
+                    await chrome.storage.local.remove('settings');
+                    console.log('[Settings] Migrated old nested settings to flat structure:', newSettings);
+                }
+            }
+        } catch (e) {
+            // 迁移失败静默忽略
+        }
+    },
+
+    // DB `settings` 表是权威数据源，`chrome.storage.local` 仅作为 service-worker 的同步副本。
+    // 合并逻辑：完全以 DB 为准，chrome.storage.local 仅用于补充 DB 中不存在的 key（首次安装回退）。
     async loadSettings() {
         const all = await DB.getAll('settings');
         this.settings = {};
         all.forEach(s => { this.settings[s.key] = s.value; });
 
-        // Also load from chrome.storage.local
+        // 仅从 chrome.storage.local 回填 DB 中不存在的 key（首次安装场景）
         try {
             const result = await chrome.storage.local.get([
-                'apiKey', 'monitoringEnabled', 'checkInterval', 'refreshInterval', 'notificationsEnabled'
+                SETTINGS_KEYS.API_KEY,
+                SETTINGS_KEYS.MONITORING_ENABLED,
+                SETTINGS_KEYS.CHECK_INTERVAL,
+                SETTINGS_KEYS.REFRESH_INTERVAL,
+                SETTINGS_KEYS.NOTIFICATIONS_ENABLED
             ]);
-            if (result.apiKey && !this.settings.apiKey) this.settings.apiKey = result.apiKey;
-            if (result.monitoringEnabled !== undefined && this.settings.monitoringEnabled === undefined)
-                this.settings.monitoringEnabled = result.monitoringEnabled;
-            if (result.checkInterval && !this.settings.checkInterval)
-                this.settings.checkInterval = result.checkInterval;
-            if (result.refreshInterval && !this.settings.refreshInterval)
-                this.settings.refreshInterval = result.refreshInterval;
-            if (result.notificationsEnabled !== undefined && this.settings.notificationsEnabled === undefined)
-                this.settings.notificationsEnabled = result.notificationsEnabled;
+            // 仅当 DB 中不存在该 key 时才从 chrome.storage.local 回退
+            if (result[SETTINGS_KEYS.API_KEY] && this.settings[SETTINGS_KEYS.API_KEY] === undefined)
+                this.settings[SETTINGS_KEYS.API_KEY] = result[SETTINGS_KEYS.API_KEY];
+            if (result[SETTINGS_KEYS.MONITORING_ENABLED] !== undefined && this.settings[SETTINGS_KEYS.MONITORING_ENABLED] === undefined)
+                this.settings[SETTINGS_KEYS.MONITORING_ENABLED] = result[SETTINGS_KEYS.MONITORING_ENABLED];
+            if (result[SETTINGS_KEYS.CHECK_INTERVAL] && this.settings[SETTINGS_KEYS.CHECK_INTERVAL] === undefined)
+                this.settings[SETTINGS_KEYS.CHECK_INTERVAL] = result[SETTINGS_KEYS.CHECK_INTERVAL];
+            if (result[SETTINGS_KEYS.REFRESH_INTERVAL] && this.settings[SETTINGS_KEYS.REFRESH_INTERVAL] === undefined)
+                this.settings[SETTINGS_KEYS.REFRESH_INTERVAL] = result[SETTINGS_KEYS.REFRESH_INTERVAL];
+            if (result[SETTINGS_KEYS.NOTIFICATIONS_ENABLED] !== undefined && this.settings[SETTINGS_KEYS.NOTIFICATIONS_ENABLED] === undefined)
+                this.settings[SETTINGS_KEYS.NOTIFICATIONS_ENABLED] = result[SETTINGS_KEYS.NOTIFICATIONS_ENABLED];
         } catch (e) {
             // chrome.storage.local may not be available
         }
     },
 
+    // 写入顺序：DB 是权威数据源，先写 DB，成功后再同步到 chrome.storage.local
     async saveSetting(key, value) {
         this.settings[key] = value;
-        await DB.put('settings', { key, value });
         try {
-            await chrome.storage.local.set({ [key]: value });
-        } catch (e) { /* ignore */ }
+            await DB.put('settings', { key, value });
+            // DB 写入成功后才同步到 chrome.storage.local（service-worker 副本）
+            try {
+                await chrome.storage.local.set({ [key]: value });
+            } catch (e) { /* chrome.storage.local 不可用，不影响核心功能 */ }
+        } catch (e) {
+            console.error('[SettingsPage] Failed to save setting to DB:', key, e);
+            Utils.toast('保存设置失败', 'error');
+        }
     },
 
     notifyAlarms() {
@@ -55,7 +101,7 @@ window.SettingsPage = {
         this._bindEvents();
 
         // Load company info if API key exists
-        if (this.settings.apiKey || TornAPI._key) {
+        if (this.settings[SETTINGS_KEYS.API_KEY] || TornAPI._key) {
             this._loadCompanyInfo();
         }
     },
@@ -63,11 +109,11 @@ window.SettingsPage = {
     _buildPageHTML() {
         const keyType = this.showKey ? 'text' : 'password';
         const eyeIcon = this.showKey ? 'fa-eye-slash' : 'fa-eye';
-        const apiKey = this.settings.apiKey || '';
-        const monitoring = this.settings.monitoringEnabled ?? false;
-        const notifications = this.settings.notificationsEnabled ?? true;
-        const checkInterval = this.settings.checkInterval || 5;
-        const refreshInterval = this.settings.refreshInterval || 15;
+        const apiKey = this.settings[SETTINGS_KEYS.API_KEY] || '';
+        const monitoring = this.settings[SETTINGS_KEYS.MONITORING_ENABLED] ?? false;
+        const notifications = this.settings[SETTINGS_KEYS.NOTIFICATIONS_ENABLED] ?? true;
+        const checkInterval = this.settings[SETTINGS_KEYS.CHECK_INTERVAL] || 5;
+        const refreshInterval = this.settings[SETTINGS_KEYS.REFRESH_INTERVAL] || 15;
 
         return `
             <div class="flex items-center justify-between mb-6">
@@ -198,13 +244,13 @@ window.SettingsPage = {
                 return;
             }
             await TornAPI.setKey(key);
-            await this.saveSetting('apiKey', key);
+            await this.saveSetting(SETTINGS_KEYS.API_KEY, key);
             Utils.toast('API密钥已保存', 'success');
         });
 
         // Validate API key
         document.getElementById('settings-validate-key')?.addEventListener('click', async () => {
-            const key = document.getElementById('settings-api-key')?.value.trim() || this.settings.apiKey;
+            const key = document.getElementById('settings-api-key')?.value.trim() || this.settings[SETTINGS_KEYS.API_KEY];
             if (!key) {
                 Utils.toast('请先输入API密钥', 'error');
                 return;
@@ -226,28 +272,28 @@ window.SettingsPage = {
 
         // Rehab monitor toggle
         document.getElementById('settings-rehab-monitor')?.addEventListener('change', async (e) => {
-            await this.saveSetting('monitoringEnabled', e.target.checked);
+            await this.saveSetting(SETTINGS_KEYS.MONITORING_ENABLED, e.target.checked);
             this.notifyAlarms();
             Utils.toast(`康复监控已${e.target.checked ? '开启' : '关闭'}`, 'info');
         });
 
         // Notifications toggle
         document.getElementById('settings-notifications')?.addEventListener('change', async (e) => {
-            await this.saveSetting('notificationsEnabled', e.target.checked);
+            await this.saveSetting(SETTINGS_KEYS.NOTIFICATIONS_ENABLED, e.target.checked);
             this.notifyAlarms();
             Utils.toast(`通知已${e.target.checked ? '开启' : '关闭'}`, 'info');
         });
 
         // Check interval
         document.getElementById('settings-check-interval')?.addEventListener('change', async (e) => {
-            await this.saveSetting('checkInterval', parseInt(e.target.value) || 5);
+            await this.saveSetting(SETTINGS_KEYS.CHECK_INTERVAL, parseInt(e.target.value) || 5);
             this.notifyAlarms();
             Utils.toast('检查间隔已更新', 'info');
         });
 
         // Refresh interval
         document.getElementById('settings-refresh-interval')?.addEventListener('change', async (e) => {
-            await this.saveSetting('refreshInterval', parseInt(e.target.value) || 15);
+            await this.saveSetting(SETTINGS_KEYS.REFRESH_INTERVAL, parseInt(e.target.value) || 15);
             this.notifyAlarms();
             Utils.toast('刷新间隔已更新', 'info');
         });

@@ -38,29 +38,20 @@ window.DashboardPage = {
   },
 
   async _loadAndRender() {
-    // Try V1 combined first
-    let profile, employees, stock, detailed;
-    try {
-      const data = await TornAPI.getCompanyFull();
-      profile = data.company || {};
-      employees = data.company_employees || {};
-      stock = data.company_stock || {};
-      detailed = data.company_detailed || {};
-    } catch (e) {
-      // Fallback to separate calls
-      const pData = await TornAPI.getCompanyProfile();
-      profile = pData.company || {};
-      const eData = await TornAPI.getCompanyEmployees();
-      employees = {};
-      (eData.employees || []).forEach(emp => { employees[emp.id] = emp; });
-      const sData = await TornAPI.getCompanyStock();
-      stock = {};
-      (sData.stock || []).forEach(item => { stock[item.name] = item; });
-      const dData = await TornAPI.getCompanyDetailed();
-      detailed = dData.company_detailed || {};
-    }
+    // 使用缓存 + 统一 API（内部处理 V1/V2 差异与回退）
+    const data = await AppCache.getOrFetch('companyData', () => TornAPI.getCompanyData());
+    const { profile, detailed } = data;
 
-    // Save snapshot
+    // 恢复 object 格式以兼容快照存储
+    const employees = {};
+    (data.employees || []).forEach(emp => { employees[emp.id || emp.player_id] = emp; });
+    const stock = {};
+    (data.stock || []).forEach(item => { stock[item.name] = item; });
+
+    // 同步员工到 employees_master（幂等，不标记离职）
+    await Utils.syncEmployeesMaster(data.employees || []);
+
+    // Save snapshot（格式保持不变，兼容历史数据）
     await DB.put('snapshots', {
       date: Utils.todayKey(),
       timestamp: Math.floor(Date.now() / 1000),

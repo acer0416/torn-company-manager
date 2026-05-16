@@ -5,6 +5,7 @@ window.TrainingPage = {
     records: [],
     config: { weekly_free_trains: 0, train_price_k: 50 },
     _trainsAvailable: 0,
+    _eventsBound: false,
 
     async init() {
         await this.render();
@@ -25,7 +26,7 @@ window.TrainingPage = {
                 ${this._headerHTML()}
                 <div class="text-red-400 p-4">Error: ${e.message}</div>
             `;
-            this._bindHeaderEvents();
+            this._bindEvents();
         }
     },
 
@@ -41,18 +42,21 @@ window.TrainingPage = {
         const wk = Utils.weekKey();
         this.records = (allRecords || []).filter(r => r.week === wk);
 
-        // Load employees
+        // Load employees（使用缓存 + 统一 API）
         try {
-            const data = await TornAPI.getCompanyEmployees();
-            this.employees = Object.entries(data.employees || data).map(([id, e]) => ({
+            const data = await AppCache.getOrFetch('employees', () => TornAPI.getEmployeesUnified());
+            this.employees = (data || []).map(e => ({
                 ...e,
-                player_id: String(id),
-                name: e.name || `ID:${id}`,
+                player_id: String(e.id || e.player_id),
+                name: e.name || `ID:${e.id || e.player_id}`,
                 position: e.position?.name || e.position || 'N/A'
             }));
         } catch (e) {
             this.employees = [];
         }
+
+        // 同步员工到 employees_master（幂等，不标记离职）
+        await Utils.syncEmployeesMaster(this.employees);
 
         // Fetch trains_available from API
         try {
@@ -260,48 +264,40 @@ window.TrainingPage = {
         const c = document.getElementById('page-content');
         if (!c) return;
 
-        // Event delegation for all data-action buttons
-        c.addEventListener('click', async (e) => {
-            const btn = e.target.closest('[data-action]');
-            if (!btn) return;
+        // Only bind the delegated click handler once to avoid stacking duplicates
+        if (!this._eventsBound) {
+            this._eventsBound = true;
+            c.addEventListener('click', async (e) => {
+                const btn = e.target.closest('[data-action]');
+                if (!btn) return;
 
-            const action = btn.dataset.action;
-            switch (action) {
-                case 'refresh':
-                    await this.render();
-                    break;
-                case 'add-record':
-                    this.showAddModal();
-                    break;
-                case 'add-for-emp':
-                    this.showAddModal(btn.dataset.empId);
-                    break;
-                case 'save-config':
-                    await this._saveConfig();
-                    break;
-                case 'calculate':
-                    this._calculate();
-                    break;
-                case 'delete-record':
-                    await this._deleteRecord(btn.dataset.recordId);
-                    break;
-            }
-        });
+                const action = btn.dataset.action;
+                switch (action) {
+                    case 'refresh':
+                        await this.render();
+                        break;
+                    case 'add-record':
+                        this.showAddModal();
+                        break;
+                    case 'add-for-emp':
+                        this.showAddModal(btn.dataset.empId);
+                        break;
+                    case 'save-config':
+                        await this._saveConfig();
+                        break;
+                    case 'calculate':
+                        this._calculate();
+                        break;
+                    case 'delete-record':
+                        await this._deleteRecord(btn.dataset.recordId);
+                        break;
+                }
+            });
+        }
 
         // Init sortable tables
         UI.initSortable('train-emp-table');
         UI.initSortable('train-records-table');
-    },
-
-    _bindHeaderEvents() {
-        const c = document.getElementById('page-content');
-        if (!c) return;
-        c.addEventListener('click', async (e) => {
-            const btn = e.target.closest('[data-action]');
-            if (!btn) return;
-            if (btn.dataset.action === 'refresh') await this.render();
-            if (btn.dataset.action === 'add-record') this.showAddModal();
-        });
     },
 
     // ---- Actions ----

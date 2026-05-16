@@ -2,8 +2,10 @@
 window.DataPage = {
     stores: [
         'snapshots', 'employee_history', 'stock_history', 'transactions',
-        'employee_notes', 'training_records', 'training_config', 'rehab_records',
-        'rehab_config', 'boost_sellers', 'company_types', 'settings', 'employees_master'
+        'employee_notes', 'training_records', 'training_config', 'tax_config',
+        'rehab_records', 'rehab_config', 'boost_sellers', 'company_types',
+        'settings', 'employees_master', 'tax_weeks', 'tax_carryover',
+        'employee_tax', 'employee_tax_rates'
     ],
     counts: {},
 

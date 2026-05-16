@@ -57,24 +57,26 @@ const Utils = {
   },
 
   // Get week key (YYYY-Wnn). If date is provided, calculate for that date; otherwise use today.
+  // 周一作为一周起始：Mon=0, Tue=1, ..., Sun=6
   weekKey(date) {
     const d = date || new Date();
     const jan1 = new Date(d.getFullYear(), 0, 1);
-    const week = Math.ceil(((d - jan1) / 86400000 + jan1.getDay() + 1) / 7);
+    const jan1MonDay = (jan1.getDay() + 6) % 7; // 0=Mon, ..., 6=Sun
+    const week = Math.ceil(((d - jan1) / 86400000 + jan1MonDay + 1) / 7);
     return d.getFullYear() + '-W' + String(week).padStart(2, '0');
   },
 
-  // Get date range from week key (exact inverse of weekKey)
+  // Get date range from week key (exact inverse of weekKey, 周一~周日)
   weekDateRange(weekKey) {
     const parts = weekKey.split('-W');
     const year = parseInt(parts[0], 10);
     const weekNum = parseInt(parts[1], 10);
     const jan1 = new Date(year, 0, 1);
-    const jan1Day = jan1.getDay();
-    // Derivation from weekKey: ceil((days + jan1Day + 1) / 7) = W
-    // → 7*(W-1) - jan1Day ≤ days ≤ 7*W - 1 - jan1Day
-    const startDayOfYear = 7 * (weekNum - 1) - jan1Day;
-    const endDayOfYear = 7 * weekNum - 1 - jan1Day;
+    const jan1MonDay = (jan1.getDay() + 6) % 7; // 0=Mon, ..., 6=Sun
+    // Derivation from weekKey: ceil((days + jan1MonDay + 1) / 7) = W
+    // → 7*(W-1) - jan1MonDay ≤ days ≤ 7*W - 1 - jan1MonDay
+    const startDayOfYear = 7 * (weekNum - 1) - jan1MonDay;
+    const endDayOfYear = 7 * weekNum - 1 - jan1MonDay;
     const start = new Date(year, 0, 1 + startDayOfYear);
     const end = new Date(year, 0, 1 + endDayOfYear);
     return { start: start, end: end };
@@ -255,5 +257,41 @@ const Utils = {
     if (str.endsWith('m')) return Math.round(parseFloat(str) * 1000000);
     if (str.endsWith('b')) return Math.round(parseFloat(str) * 1000000000);
     return parseInt(str.replace(/,/g, ''), 10) || 0;
+  },
+
+  // 同步员工到 employees_master（幂等：仅新增和更新 last_seen/name/position）
+  // 不标记离职 —— 只有 EmployeePage 负责入职/离职逻辑
+  // 统一使用 Number 类型作为 player_id，与 EmployeePage 保持一致
+  async syncEmployeesMaster(employees) {
+    if (!employees || !Array.isArray(employees)) return;
+    for (const emp of employees) {
+      const playerId = Number(emp.id || emp.player_id);
+      if (!playerId) continue;
+      try {
+        const existing = await DB.get('employees_master', playerId);
+        if (!existing) {
+          await DB.put('employees_master', {
+            player_id: playerId,
+            name: emp.name || `ID:${playerId}`,
+            position: emp.position?.name || emp.position || 'N/A',
+            first_seen: Utils.todayKey(),
+            last_seen: Utils.todayKey(),
+            left_date: null
+          });
+        } else {
+          // 如果 existing 的 player_id 是字符串类型，修正为 Number
+          await DB.put('employees_master', {
+            ...existing,
+            player_id: playerId,
+            name: emp.name || existing.name,
+            position: emp.position?.name || emp.position || existing.position,
+            last_seen: Utils.todayKey()
+            // 保留 left_date（只有 EmployeePage 负责设置）
+          });
+        }
+      } catch (e) {
+        // 静默处理（并发冲突等）
+      }
+    }
   }
 };

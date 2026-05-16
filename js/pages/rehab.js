@@ -29,12 +29,12 @@ window.RehabPage = {
     },
 
     async _loadData() {
-        // Fetch employees from API
+        // Fetch employees from API（使用缓存 + 统一 API）
         try {
-            const data = await TornAPI.getCompanyEmployees();
-            this.employees = Object.entries(data.employees || data).map(([id, e]) => ({
-                player_id: String(id),
-                name: e.name || `ID:${id}`,
+            const data = await AppCache.getOrFetch('employees', () => TornAPI.getEmployeesUnified());
+            this.employees = (data || []).map(e => ({
+                player_id: String(e.id || e.player_id),
+                name: e.name || `ID:${e.id || e.player_id}`,
                 position: e.position?.name || e.position || 'N/A',
                 status: e.status || {},
                 effectiveness: e.effectiveness || {},
@@ -45,20 +45,35 @@ window.RehabPage = {
             this.employees = [];
         }
 
+        // 同步员工到 employees_master（幂等，不标记离职）
+        await Utils.syncEmployeesMaster(this.employees);
+
         // Load rehab records from DB
         this.rehabRecords = (await DB.getAll('rehab_records')) || [];
 
         // Auto-detect rehab: if employee status shows Traveling to Switzerland
+        // 去重策略：player_id + date 联合检查（内存 + DB）
+        const todayStr = Utils.todayKey();
         for (const emp of this.employees) {
             if (this._isTravelingToSwitzerland(emp)) {
-                const alreadyLogged = this.rehabRecords.some(r =>
-                    String(r.player_id) === String(emp.player_id) && r.date === Utils.todayKey()
+                // 先检查内存
+                const alreadyLoggedMem = this.rehabRecords.some(r =>
+                    String(r.player_id) === String(emp.player_id) && r.date === todayStr
                 );
-                if (!alreadyLogged) {
+                if (alreadyLoggedMem) continue;
+
+                // 再查 DB 确保无竞态条件下的重复记录
+                let alreadyLoggedDB = false;
+                try {
+                    const playerRecords = await DB.getByIndex('rehab_records', 'player_id', emp.player_id);
+                    alreadyLoggedDB = (playerRecords || []).some(r => r.date === todayStr);
+                } catch (e) { /* 索引查询失败，忽略 */ }
+
+                if (!alreadyLoggedDB) {
                     const record = {
                         player_id: emp.player_id,
                         player_name: emp.name,
-                        date: Utils.todayKey(),
+                        date: todayStr,
                         timestamp: Date.now(),
                         auto_detected: true
                     };
@@ -294,10 +309,23 @@ window.RehabPage = {
 
         if (!confirm(`确认为 ${emp.name} 记录一次Rehab？`)) return;
 
+        // player_id + date 联合去重
+        const todayStr = Utils.todayKey();
+        let alreadyLoggedDB = false;
+        try {
+            const playerRecords = await DB.getByIndex('rehab_records', 'player_id', emp.player_id);
+            alreadyLoggedDB = (playerRecords || []).some(r => r.date === todayStr);
+        } catch (e) { /* ignore */ }
+
+        if (alreadyLoggedDB) {
+            Utils.toast(`${emp.name} 今天已记录过 Rehab`, 'warning');
+            return;
+        }
+
         const record = {
             player_id: emp.player_id,
             player_name: emp.name,
-            date: Utils.todayKey(),
+            date: todayStr,
             timestamp: Date.now(),
             manual: true
         };
@@ -348,6 +376,18 @@ window.RehabPage = {
             }
             const emp = this.employees.find(e => String(e.player_id) === String(empId));
             const dateVal = container.querySelector('#modal-rehab-date')?.value || Utils.todayKey();
+
+            // player_id + date 联合去重
+            let alreadyLoggedDB = false;
+            try {
+                const playerRecords = await DB.getByIndex('rehab_records', 'player_id', empId);
+                alreadyLoggedDB = (playerRecords || []).some(r => r.date === dateVal);
+            } catch (e) { /* ignore */ }
+
+            if (alreadyLoggedDB) {
+                Utils.toast(`${emp?.name || ''} 在 ${dateVal} 已记录过 Rehab`, 'warning');
+                return;
+            }
 
             const record = {
                 player_id: empId,

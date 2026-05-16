@@ -2,7 +2,7 @@
 const DB = {
   db: null,
   DB_NAME: 'torn-company-manager',
-  DB_VERSION: 5,
+  DB_VERSION: 6,
 
   async init() {
     return new Promise((resolve, reject) => {
@@ -48,6 +48,10 @@ const DB = {
         // Training config
         if (!db.objectStoreNames.contains('training_config')) {
           db.createObjectStore('training_config', { keyPath: 'key' });
+        }
+        // Tax config
+        if (!db.objectStoreNames.contains('tax_config')) {
+          db.createObjectStore('tax_config', { keyPath: 'key' });
         }
         // Rehab monitoring records
         if (!db.objectStoreNames.contains('rehab_records')) {
@@ -183,8 +187,8 @@ const DB = {
   // Export all data
   async exportAll() {
     const stores = ['snapshots', 'employee_history', 'stock_history', 'transactions',
-      'employee_notes', 'training_records', 'training_config', 'rehab_records',
-      'rehab_config', 'boost_sellers', 'settings', 'employees_master',
+      'employee_notes', 'training_records', 'training_config', 'tax_config',
+      'rehab_records', 'rehab_config', 'boost_sellers', 'settings', 'employees_master',
       'tax_weeks', 'tax_carryover', 'employee_tax', 'employee_tax_rates'];
     const data = {};
     for (const store of stores) {
@@ -198,8 +202,8 @@ const DB = {
   // Import all data
   async importAll(data) {
     const stores = ['snapshots', 'employee_history', 'stock_history', 'transactions',
-      'employee_notes', 'training_records', 'training_config', 'rehab_records',
-      'rehab_config', 'boost_sellers', 'settings', 'employees_master',
+      'employee_notes', 'training_records', 'training_config', 'tax_config',
+      'rehab_records', 'rehab_config', 'boost_sellers', 'settings', 'employees_master',
       'tax_weeks', 'tax_carryover', 'employee_tax', 'employee_tax_rates'];
     for (const store of stores) {
       if (data[store] && data[store].length) {

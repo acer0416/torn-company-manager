@@ -56,8 +56,8 @@ window.EmployeePage = (() => {
   }
 
   async function _loadAndRender() {
-    const data = await TornAPI.getCompanyEmployees();
-    employees = Array.isArray(data) ? data : (data.employees || []);
+    const data = await AppCache.getOrFetch('employees', () => TornAPI.getEmployeesUnified());
+    employees = data;
 
     // Save snapshots to employee_history
     const today = Utils.todayKey();
@@ -77,16 +77,19 @@ window.EmployeePage = (() => {
     }
 
     // Track in employees_master (detect new/leaving)
+    // 统一使用 Number 类型的 player_id 防止 key 类型不一致导致重复记录
     const existingMasters = await DB.getAll('employees_master');
     const existingMap = new Map();
-    existingMasters.forEach(m => existingMap.set(m.player_id, m));
-    const currentIds = new Set(employees.map(e => e.id));
+    existingMasters.forEach(m => existingMap.set(Number(m.player_id), m));
+    const currentIds = new Set(employees.map(e => Number(e.id || e.player_id)));
 
     for (const emp of employees) {
-      const existing = existingMap.get(emp.id);
+      const pid = Number(emp.id || emp.player_id);
+      if (!pid) continue;
+      const existing = existingMap.get(pid);
       if (!existing) {
         await DB.put('employees_master', {
-          player_id: emp.id,
+          player_id: pid,
           name: emp.name,
           position: emp.position?.name || '',
           first_seen: today,
@@ -94,6 +97,8 @@ window.EmployeePage = (() => {
           left_date: null
         });
       } else {
+        // 如果 existing 的 player_id 是字符串类型，修正为 Number
+        existing.player_id = pid;
         existing.last_seen = today;
         existing.name = emp.name;
         existing.position = emp.position?.name || '';
@@ -103,7 +108,7 @@ window.EmployeePage = (() => {
 
     // Mark leaving employees
     for (const m of existingMasters) {
-      if (!currentIds.has(m.player_id) && !m.left_date) {
+      if (!currentIds.has(Number(m.player_id)) && !m.left_date) {
         m.left_date = today;
         await DB.put('employees_master', m);
       }
