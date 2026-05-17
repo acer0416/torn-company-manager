@@ -414,17 +414,18 @@ window.TrainingPage = {
                 const counts = {};
                 const entries = snapshot.entries || [];
                 for (const entry of entries) {
-                    // 尝试通过 playerName 匹配员工 ID
-                    const emp = this.employees.find(e =>
-                        e.name && entry.playerName &&
-                        e.name.toLowerCase() === entry.playerName.toLowerCase()
-                    );
+                    const emp = this._matchEmployee(entry);
                     if (emp) {
                         counts[emp.player_id] = (counts[emp.player_id] || 0) + 1;
                     }
                 }
                 this._apiTrainCounts = counts;
-                console.log('[TrainingPage] Scraped training data:', entries.length, 'entries, matched', Object.keys(counts).length, 'employees');
+                const unmatchedCount = entries.length - Object.values(counts).reduce((s, n) => s + n, 0);
+                console.log('[TrainingPage] Scraped training data:', entries.length, 'entries, matched', Object.keys(counts).length, 'employees, unmatched', unmatchedCount);
+                if (unmatchedCount > 0) {
+                    const sampleUnmatched = entries.filter(e => !this._matchEmployee(e)).slice(0, 3);
+                    console.warn('[TrainingPage] Sample unmatched entries:', sampleUnmatched.map(e => ({ playerName: e.playerName, rawText: e.rawText?.substring(0, 80) })));
+                }
             }
 
             // 重新获取公司详情（更新可用训练次数）
@@ -466,6 +467,62 @@ window.TrainingPage = {
                 console.error('[TrainingPage] _refetchTrainData fallback:', e2);
             }
         }
+    },
+
+    /**
+     * 将 content script 抓取的训练条目匹配到本地员工列表
+     * 支持多种匹配策略：
+     * 1. 从 rawText 中提取 XID= 格式的玩家 ID（与 Torn API news 格式一致）
+     * 2. 从 playerName 中提取 [数字] 格式的 ID
+     * 3. 纯名称匹配（去除 [数字] 后缀后比较）
+     * @param {Object} entry - { playerName, trainer, action, rawText }
+     * @returns {Object|null} 匹配的员工对象或 null
+     */
+    _matchEmployee(entry) {
+        if (!entry || !this.employees.length) return null;
+
+        // 策略1: 从 rawText 中提取 XID= 格式的玩家 ID（Torn news HTML 格式）
+        if (entry.rawText) {
+            const xidMatch = entry.rawText.match(/XID=(\d+)/i);
+            if (xidMatch) {
+                const pid = String(xidMatch[1]);
+                const emp = this.employees.find(e => String(e.player_id) === pid);
+                if (emp) return emp;
+            }
+        }
+
+        // 策略2: 从 playerName 中提取 [数字] 格式的 ID
+        // 例如 "PlayerName [1234567]" → ID=1234567
+        if (entry.playerName) {
+            const bracketMatch = entry.playerName.match(/\[(\d+)\]/);
+            if (bracketMatch) {
+                const pid = String(bracketMatch[1]);
+                const emp = this.employees.find(e => String(e.player_id) === pid);
+                if (emp) return emp;
+            }
+        }
+
+        // 策略3: 纯名称匹配（去除 [数字] 后缀）
+        if (entry.playerName) {
+            const cleanName = entry.playerName.replace(/\s*\[\d+\]\s*/, '').trim().toLowerCase();
+            if (cleanName) {
+                const emp = this.employees.find(e =>
+                    e.name && e.name.toLowerCase() === cleanName
+                );
+                if (emp) return emp;
+            }
+        }
+
+        // 策略4: 原始 playerName 精确匹配（兼容旧格式）
+        if (entry.playerName) {
+            const emp = this.employees.find(e =>
+                e.name && entry.playerName &&
+                e.name.toLowerCase() === entry.playerName.toLowerCase()
+            );
+            if (emp) return emp;
+        }
+
+        return null;
     },
 
     _showEditModal(recordId) {
