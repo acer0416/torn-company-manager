@@ -154,24 +154,16 @@ window.TrainingPage = {
     _kpiHTML() {
         const records = this.records;
         const apiCounts = this._apiTrainCounts || {};
-        // API 训练总次数（可能不完整，仅最近 25 条新闻）
         const apiTotalTrains = Object.values(apiCounts).reduce((s, n) => s + (Number(n) || 0), 0);
-        // 本地记录训练总次数（主要数据源）
-        const localTotalTrains = records.reduce((s, r) => s + (r.trains_count || 0), 0);
         const freeGiven = records.filter(r => r.type === 'free').reduce((s, r) => s + (r.trains_count || 0), 0);
         const paid = records.filter(r => r.type === 'paid').reduce((s, r) => s + (r.trains_count || 0), 0);
         const recordRevenue = records.filter(r => r.type === 'paid').reduce((s, r) => s + (r.amount_paid || 0), 0);
         const txRevenue = (this._trainTransactions || []).reduce((s, tx) => s + (tx.amount || 0), 0);
         const totalRevenue = txRevenue > 0 ? txRevenue : recordRevenue;
 
-        // 如果 API 数据与本地记录不一致，显示提示
-        const apiNote = apiTotalTrains !== localTotalTrains
-            ? `API: ${apiTotalTrains} (仅最近25条新闻) | 本地: ${localTotalTrains}`
-            : `API 与本地一致: ${localTotalTrains}`;
-
         return `
             <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
-                ${UI.kpiCard('fas fa-dumbbell', '本周训练总次数', localTotalTrains, apiNote, 'accent')}
+                ${UI.kpiCard('fas fa-dumbbell', '本周训练总次数', apiTotalTrains, '来自 Torn API', 'accent')}
                 ${UI.kpiCard('fas fa-gift', '免费赠送', freeGiven, '本地记录', 'green')}
                 ${UI.kpiCard('fas fa-coins', '付费训练', paid, '本地记录', 'gold')}
                 ${UI.kpiCard('fas fa-dollar-sign', '训练收入', Utils.formatMoney(totalRevenue), `记录: ${Utils.formatMoney(recordRevenue)} | 交易: ${Utils.formatMoney(txRevenue)}`, 'blue')}
@@ -208,7 +200,6 @@ window.TrainingPage = {
             { key: 'name', label: '姓名', sortable: true },
             { key: 'position', label: '职位', sortable: true },
             { key: 'trainsCount', label: '本周训练次数', sortable: true },
-            { key: 'apiCount', label: 'API 参考', sortable: true },
             { key: 'type', label: '训练类型' },
             { key: 'amountPaid', label: '已付金额', sortable: true },
             { key: 'actions', label: '操作', sortable: false }
@@ -218,10 +209,8 @@ window.TrainingPage = {
         const apiCounts = this._apiTrainCounts || {};
         const rows = this.employees.map(emp => {
             const empRecords = records.filter(r => String(r.player_id) === String(emp.player_id));
-            // 使用本地训练记录计算训练次数（主要数据源，可靠）
-            const localTrains = empRecords.reduce((s, r) => s + (r.trains_count || 0), 0);
-            // API 数据作为参考（可能不完整，Torn API 只返回最近 25 条新闻）
             const apiCount = apiCounts[String(emp.player_id)];
+            const trainsCount = apiCount !== undefined && apiCount !== null ? apiCount : 0;
             const types = [...new Set(empRecords.map(r => r.type))];
             const totalPaid = empRecords.reduce((s, r) => s + (r.amount_paid || 0), 0);
 
@@ -232,22 +221,11 @@ window.TrainingPage = {
                 }).join(' ')
                 : '<span class="badge badge-gray">无</span>';
 
-            // API 参考列：显示 API 计数，如果与本地不一致则高亮提示
-            let apiDisplay = '<span class="text-gray-500">—</span>';
-            if (apiCount !== undefined && apiCount !== null) {
-                if (apiCount !== localTrains) {
-                    apiDisplay = `<span class="text-yellow-400" title="API 数据可能不完整（仅最近 25 条新闻），以本地记录为准">${apiCount} ⚠</span>`;
-                } else {
-                    apiDisplay = `<span class="text-gray-400">${apiCount}</span>`;
-                }
-            }
-
             return {
                 id: emp.player_id,
                 name: `<a href="https://www.torn.com/profiles.php?XID=${emp.player_id}" target="_blank" class="text-torn-accent hover:underline">${emp.name}</a>`,
                 position: emp.position,
-                trainsCount: `<span class="font-bold text-white">${localTrains}</span>`,
-                apiCount: apiDisplay,
+                trainsCount: `<span class="font-bold text-white">${trainsCount}</span>`,
                 type: typeBadges,
                 amountPaid: Utils.formatMoney(totalPaid),
                 actions: `<button class="btn btn-xs btn-primary" data-action="add-for-emp" data-emp-id="${emp.player_id}"><i class="fas fa-plus"></i> 训练</button>`
@@ -259,9 +237,6 @@ window.TrainingPage = {
                 <h3 class="text-lg font-bold text-white mb-4">
                     <i class="fas fa-users mr-2 text-torn-accent"></i>员工训练记录 (本周)
                 </h3>
-                <p class="text-xs text-gray-500 mb-3">
-                    <i class="fas fa-info-circle mr-1"></i>训练次数以本地记录为准。API 参考列显示 Torn 公司新闻中的数据（仅最近 25 条，可能不完整）。
-                </p>
                 ${UI.dataTable({
                     headers,
                     rows,
