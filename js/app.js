@@ -106,8 +106,9 @@
   document.getElementById('btn-refresh')?.addEventListener('click', async () => {
     Utils.showLoading('刷新中...');
     try {
-      // 清除 companyData 缓存，强制重新获取（header 和刷新按钮统一使用 companyData）
+      // 清除公司/库存缓存，强制重新获取
       AppCache.invalidate('companyData');
+      AppCache.invalidate('stock');
       const data = await AppCache.getOrFetch('companyData', () => TornAPI.getCompanyData());
       const today = Utils.todayKey();
       // 恢复 object 格式以兼容快照存储

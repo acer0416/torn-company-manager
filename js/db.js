@@ -2,7 +2,7 @@
 const DB = {
   db: null,
   DB_NAME: 'torn-company-manager',
-  DB_VERSION: 6,
+  DB_VERSION: 7,
 
   async init() {
     return new Promise((resolve, reject) => {
@@ -101,6 +101,12 @@ const DB = {
         if (!db.objectStoreNames.contains('employee_tax_rates')) {
           db.createObjectStore('employee_tax_rates', { keyPath: 'player_id' });
         }
+        // Merit history (v7)
+        if (!db.objectStoreNames.contains('merit_history')) {
+          const mhStore = db.createObjectStore('merit_history', { keyPath: 'id', autoIncrement: true });
+          mhStore.createIndex('player_id', 'player_id');
+          mhStore.createIndex('date', 'date');
+        }
         // Add week_key index to existing transactions store (v3→v4 upgrade)
         if (db.objectStoreNames.contains('transactions')) {
           var txStore = e.target.transaction.objectStore('transactions');
@@ -189,7 +195,8 @@ const DB = {
     const stores = ['snapshots', 'employee_history', 'stock_history', 'transactions',
       'employee_notes', 'training_records', 'training_config', 'tax_config',
       'rehab_records', 'rehab_config', 'boost_sellers', 'settings', 'employees_master',
-      'tax_weeks', 'tax_carryover', 'employee_tax', 'employee_tax_rates'];
+      'tax_weeks', 'tax_carryover', 'employee_tax', 'employee_tax_rates',
+      'merit_history'];
     const data = {};
     for (const store of stores) {
       data[store] = await this.getAll(store);
@@ -204,7 +211,8 @@ const DB = {
     const stores = ['snapshots', 'employee_history', 'stock_history', 'transactions',
       'employee_notes', 'training_records', 'training_config', 'tax_config',
       'rehab_records', 'rehab_config', 'boost_sellers', 'settings', 'employees_master',
-      'tax_weeks', 'tax_carryover', 'employee_tax', 'employee_tax_rates'];
+      'tax_weeks', 'tax_carryover', 'employee_tax', 'employee_tax_rates',
+      'merit_history'];
     for (const store of stores) {
       if (data[store] && data[store].length) {
         await this.clear(store);

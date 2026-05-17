@@ -29,6 +29,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     await checkRehabStatus();
   } else if (alarm.name === 'auto-refresh') {
     await refreshCompanyData();
+  } else if (alarm.name === 'boost-points-regen') {
+    await regenerateBoostSellerPoints();
   }
 });
 
@@ -39,6 +41,14 @@ chrome.runtime.onStartup.addListener(() => {
 
 // Also setup alarms when service worker activates
 setupAlarms();
+
+function msUntilNext2AM() {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(2, 0, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  return next - now;
+}
 
 async function setupAlarms() {
   const items = await chrome.storage.local.get([
@@ -60,6 +70,42 @@ async function setupAlarms() {
     chrome.alarms.create('auto-refresh', {
       periodInMinutes: items.refreshInterval || 60
     });
+  }
+
+  chrome.alarms.create('boost-points-regen', {
+    delayInMinutes: Math.max(1, msUntilNext2AM() / 60000),
+    periodInMinutes: 24 * 60
+  });
+}
+
+/** 每日凌晨 2 点：有总点数的 Boost 卖家自动 +10 点 */
+async function regenerateBoostSellerPoints() {
+  const hour = new Date().getHours();
+  if (hour !== 2) return;
+
+  try {
+    const db = await openDB();
+    const tx = db.transaction('boost_sellers', 'readwrite');
+    const store = tx.objectStore('boost_sellers');
+    const all = await new Promise((resolve) => {
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => resolve([]);
+    });
+    const today = new Date().toISOString().slice(0, 10);
+    for (const seller of all) {
+      if ((seller.total_points || 0) <= 0) continue;
+      if (seller.last_regen_date === today) continue;
+      seller.total_points = (seller.total_points || 0) + 10;
+      seller.last_regen_date = today;
+      seller.last_updated = Date.now();
+      store.put(seller);
+    }
+    await new Promise((resolve) => { tx.oncomplete = resolve; tx.onerror = resolve; });
+    db.close();
+    console.log('[Boost] Daily +10 points applied where applicable');
+  } catch (err) {
+    console.error('[Boost] regenerateBoostSellerPoints failed:', err);
   }
 }
 
@@ -154,7 +200,7 @@ async function recordRehabEvent(playerId, playerName) {
 // IndexedDB helper for service worker
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('torn-company-manager', 6);
+    const req = indexedDB.open('torn-company-manager', 7);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });

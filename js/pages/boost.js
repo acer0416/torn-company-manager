@@ -2,6 +2,36 @@
 window.BoostPage = {
     sellers: [],
 
+    // Parse URLs and plain IDs from input text
+    _parseURLIDs(input) {
+        if (!input) return [];
+        const ids = new Set();
+        const urlPattern = /(?:https?:\/\/)?(?:www\.)?torn\.com\/profiles\.php\?[XN]ID=(\d+)/gi;
+        let match;
+        while ((match = urlPattern.exec(input)) !== null) {
+            ids.add(match[1]);
+        }
+        // If no URLs found, fall back to extracting plain numbers
+        if (ids.size === 0) {
+            const numPattern = /\b(\d+)\b/g;
+            while ((match = numPattern.exec(input)) !== null) {
+                ids.add(match[1]);
+            }
+        }
+        return [...ids];
+    },
+
+    // Resolve player name from Torn API
+    async _resolvePlayerName(playerId) {
+        try {
+            const info = await TornAPI.getPlayerInfo(playerId);
+            return info.name || null;
+        } catch (e) {
+            console.warn(`[BoostPage] Failed to resolve name for ID ${playerId}:`, e.message);
+            return null;
+        }
+    },
+
     async init() {
         await this.render();
     },
@@ -12,9 +42,20 @@ window.BoostPage = {
         Utils.showLoading('加载Boost数据...');
         try {
             this.sellers = await DB.getAll('boost_sellers');
+            for (const s of this.sellers) {
+                const norm = Utils.normalizeBoostPrice(s.price_per_boost);
+                if (norm !== s.price_per_boost) {
+                    s.price_per_boost = norm;
+                    await DB.put('boost_sellers', s);
+                }
+            }
             // Also load boost transactions for stats
             const allTx = (await DB.getAll('transactions')) || [];
-            this.boostTransactions = allTx.filter(t => t.category === 'boost');
+            this.boostTransactions = allTx
+                .filter(t => t.category === 'boost')
+                .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+            await Utils.reconcileBoostSellersFromTransactions();
+            this.sellers = await DB.getAll('boost_sellers');
             Utils.hideLoading();
             c.innerHTML = this._buildPageHTML();
             this._bindEvents();
@@ -52,6 +93,7 @@ window.BoostPage = {
                 ${UI.kpiCard('fas fa-dollar-sign', '总花费', Utils.formatMoney(totalCostPaid), '已付款项', 'green')}
             </div>
             <div id="boost-seller-table" class="card mb-6"></div>
+            <div id="boost-purchases-table" class="card"></div>
         `;
     },
 
@@ -59,6 +101,7 @@ window.BoostPage = {
         document.getElementById('boost-add-seller')?.addEventListener('click', () => this.showAddSellerModal());
         document.getElementById('boost-refresh')?.addEventListener('click', () => this.render());
         this._renderSellerTable();
+        this._renderPurchasesTable();
     },
 
     _renderSellerTable() {
@@ -85,7 +128,9 @@ window.BoostPage = {
             const remaining = (seller.total_points || 0) - (seller.points_used || 0);
             const boostsAvail = Math.max(0, Math.floor(remaining / 250));
             const remainColor = remaining < 250 ? 'text-red-400' : 'text-torn-green';
-            const lastPurchased = seller.last_updated ? Utils.relativeTime(seller.last_updated / 1000) : '-';
+            const lastPurchased = seller.last_purchased_at
+              ? Utils.relativeTime(seller.last_purchased_at / 1000)
+              : '-';
 
             let actionsHtml = '<div class="flex gap-1">';
             if (boostsAvail > 0) {
@@ -98,7 +143,7 @@ window.BoostPage = {
             return {
                 id: seller.id,
                 name: seller.player_name || `ID:${seller.player_id}`,
-                price: Utils.formatMoney((seller.price_per_boost || 0) * 1000),
+                price: Utils.formatMoney(Utils.normalizeBoostPrice(seller.price_per_boost)),
                 remaining: `<span class="${remainColor}">${Utils.formatShort(remaining)}</span>`,
                 boosts_avail: String(boostsAvail),
                 lastPurchased: lastPurchased,
@@ -134,6 +179,66 @@ window.BoostPage = {
         });
     },
 
+    _renderPurchasesTable() {
+        const container = document.getElementById('boost-purchases-table');
+        if (!container) return;
+
+        const txs = this.boostTransactions || [];
+        if (!txs.length) {
+            container.innerHTML = `
+                <h3 class="text-lg font-bold text-white mb-3 px-4 pt-4">
+                    <i class="fas fa-receipt mr-2 text-torn-gold"></i>购买记录
+                </h3>
+                ${UI.emptyState('fas fa-receipt', '暂无 Boost 购买记录')}
+            `;
+            return;
+        }
+
+        const headers = [
+            { key: 'date', label: '日期', sortable: true },
+            { key: 'seller', label: '卖家', sortable: true },
+            { key: 'amount', label: '金额', sortable: true },
+            { key: 'note', label: '备注' },
+            { key: 'actions', label: '操作', sortable: false }
+        ];
+
+        const rows = txs.map(tx => {
+            let ts = tx.timestamp || 0;
+            if (ts > 0 && ts < 1e12) ts *= 1000;
+            return {
+                id: tx.id,
+                date: tx.date || (ts ? Utils.formatDateTime(ts) : '-'),
+                seller: tx.player_name || `ID:${tx.player_id}`,
+                amount: Utils.formatTransactionAmount(tx),
+                note: tx.note || '—',
+                actions: `<button class="btn btn-xs btn-secondary boost-del-purchase" data-tx-id="${tx.id}"><i class="fas fa-trash"></i></button>`
+            };
+        });
+
+        container.innerHTML = `
+            <div class="p-4">
+                <h3 class="text-lg font-bold text-white mb-4">
+                    <i class="fas fa-receipt mr-2 text-torn-gold"></i>购买记录 (${txs.length})
+                </h3>
+                ${UI.dataTable({ headers, rows, id: 'boost-purchases', sortable: true, emptyText: '暂无记录' })}
+            </div>
+        `;
+        UI.initSortable('boost-purchases');
+
+        container.querySelectorAll('.boost-del-purchase').forEach(btn => {
+            btn.addEventListener('click', () => this._deletePurchase(Number(btn.dataset.txId)));
+        });
+    },
+
+    async _deletePurchase(txId) {
+        if (!txId) return;
+        if (!confirm('删除此购买记录？将同步撤销卖家已消耗点数。')) return;
+        await DB.delete('transactions', txId);
+        await Utils.reconcileBoostSellersFromTransactions();
+        Utils.toast('购买记录已删除', 'info');
+        await this.render();
+    },
+
     showAddSellerModal() {
         const content = document.createElement('div');
         content.className = 'p-6';
@@ -144,15 +249,16 @@ window.BoostPage = {
             <div class="space-y-4">
                 <div>
                     <label class="text-gray-400 text-sm mb-1 block">玩家ID</label>
-                    <input id="add-player-id" class="input" type="text" placeholder="Torn玩家ID">
+                    <textarea id="add-player-id" class="input" rows="3" placeholder="Torn玩家ID或profile链接&#10;例如: https://www.torn.com/profiles.php?XID=123456"></textarea>
+                    <p class="text-gray-500 text-xs mt-1">支持粘贴多个链接或ID，用逗号、空格或换行分隔</p>
                 </div>
                 <div>
                     <label class="text-gray-400 text-sm mb-1 block">玩家名称</label>
-                    <input id="add-player-name" class="input" type="text" placeholder="卖家名称">
+                    <input id="add-player-name" class="input" type="text" placeholder="手动填写或粘贴链接自动获取">
                 </div>
                 <div>
-                    <label class="text-gray-400 text-sm mb-1 block">单价/Boost ($K)</label>
-                    <input id="add-price" class="input" type="number" min="0" placeholder="单位: 千美元">
+                    <label class="text-gray-400 text-sm mb-1 block">单价/Boost ($)</label>
+                    <input id="add-price" class="input" type="text" placeholder="美元，支持 k/m 后缀">
                 </div>
                 <div>
                     <label class="text-gray-400 text-sm mb-1 block">卖家总点数</label>
@@ -164,37 +270,98 @@ window.BoostPage = {
                 </div>
                 <div class="flex justify-end gap-2 mt-6">
                     <button id="add-cancel" class="btn btn-secondary">取消</button>
-                    <button id="add-save" class="btn btn-primary">添加卖家</button>
+                    <button id="add-save" class="btn btn-primary">确认添加</button>
                 </div>
             </div>
         `;
 
         Utils.showModal(content);
 
+        const idInput = content.querySelector('#add-player-id');
+        const nameInput = content.querySelector('#add-player-name');
+
+        // Auto-detect URL paste in ID field — extract ID and resolve name
+        idInput.addEventListener('input', async () => {
+            const value = idInput.value.trim();
+            if (!value || !value.includes('torn.com/profiles.php')) return;
+            const ids = this._parseURLIDs(value);
+            if (ids.length === 1) {
+                // Single profile URL — replace textarea with the resolved ID
+                idInput.value = ids[0];
+                const resolvedName = await this._resolvePlayerName(ids[0]);
+                if (resolvedName && !nameInput.value.trim()) {
+                    nameInput.value = resolvedName;
+                    Utils.toast(`已识别玩家: ${resolvedName}`, 'info');
+                }
+            } else if (ids.length > 1) {
+                Utils.toast(`检测到 ${ids.length} 个玩家链接，将批量添加`, 'info');
+            }
+        });
+
         content.querySelector('#add-cancel').addEventListener('click', () => Utils.hideModal());
         content.querySelector('#add-save').addEventListener('click', async () => {
-            const playerId = content.querySelector('#add-player-id').value.trim();
-            const playerName = content.querySelector('#add-player-name').value.trim();
-            const price = parseInt(content.querySelector('#add-price').value) || 0;
+            const rawInput = idInput.value.trim();
+            const playerName = nameInput.value.trim();
+            const price = Utils.parseMoneyInput(content.querySelector('#add-price').value);
             const totalPoints = parseInt(content.querySelector('#add-total-points').value) || 0;
             const notes = content.querySelector('#add-notes').value.trim();
 
-            if (!playerId || !playerName) {
-                Utils.toast('请填写玩家ID和名称', 'error');
+            if (!rawInput) {
+                Utils.toast('请填写玩家ID或链接', 'error');
                 return;
             }
 
-            await DB.put('boost_sellers', {
-                player_id: playerId,
-                player_name: playerName,
-                price_per_boost: price,
-                total_points: totalPoints,
-                points_used: 0,
-                last_updated: Date.now(),
-                notes: notes
-            });
+            // Parse multiple IDs from input (supports URLs or plain numbers)
+            const parsedIds = this._parseURLIDs(rawInput);
+            if (!parsedIds.length) {
+                Utils.toast('未检测到有效的玩家ID', 'error');
+                return;
+            }
 
-            Utils.toast('卖家已添加', 'success');
+            // Deduplicate within batch
+            const uniqueIds = [...new Set(parsedIds)];
+
+            let addedCount = 0;
+            let skippedCount = 0;
+            const skippedNames = [];
+
+            for (const pid of uniqueIds) {
+                // Check if seller already exists
+                const exists = this.sellers.some(s => String(s.player_id) === String(pid));
+                if (exists) {
+                    skippedCount++;
+                    const existing = this.sellers.find(s => String(s.player_id) === String(pid));
+                    skippedNames.push(existing?.player_name || `ID:${pid}`);
+                    continue;
+                }
+
+                // Resolve name: use provided name, or fetch from API
+                let resolvedName = playerName;
+                if (!resolvedName && rawInput.includes('torn.com/profiles.php')) {
+                    resolvedName = await this._resolvePlayerName(pid);
+                }
+                if (!resolvedName) {
+                    resolvedName = `ID:${pid}`;
+                }
+
+                await DB.put('boost_sellers', {
+                    player_id: pid,
+                    player_name: resolvedName,
+                    price_per_boost: price,
+                    total_points: totalPoints,
+                    points_used: 0,
+                    last_updated: Date.now(),
+                    notes: notes
+                });
+                addedCount++;
+            }
+
+            // Result summary
+            let msg = `成功添加 ${addedCount} 个卖家`;
+            if (skippedCount > 0) {
+                msg += `，跳过 ${skippedCount} 个已存在 (${skippedNames.join(', ')})`;
+            }
+            Utils.toast(msg, addedCount > 0 ? 'success' : 'warning');
             Utils.hideModal();
             this.render();
         });
@@ -213,8 +380,8 @@ window.BoostPage = {
                     <input id="edit-name" class="input" type="text" value="${seller.player_name || ''}">
                 </div>
                 <div>
-                    <label class="text-gray-400 text-sm mb-1 block">单价/Boost ($K)</label>
-                    <input id="edit-price" class="input" type="number" min="0" value="${seller.price_per_boost || 0}">
+                    <label class="text-gray-400 text-sm mb-1 block">单价/Boost ($)</label>
+                    <input id="edit-price" class="input" type="text" value="${Utils.normalizeBoostPrice(seller.price_per_boost)}">
                 </div>
                 <div>
                     <label class="text-gray-400 text-sm mb-1 block">卖家总点数</label>
@@ -237,10 +404,24 @@ window.BoostPage = {
 
         Utils.showModal(content);
 
+        // Auto-detect profile URL in name field — resolve to actual name
+        content.querySelector('#edit-name').addEventListener('input', async () => {
+            const value = content.querySelector('#edit-name').value.trim();
+            if (!value || !value.includes('torn.com/profiles.php')) return;
+            const ids = this._parseURLIDs(value);
+            if (ids.length >= 1) {
+                const resolvedName = await this._resolvePlayerName(ids[0]);
+                if (resolvedName) {
+                    content.querySelector('#edit-name').value = resolvedName;
+                    Utils.toast(`已获取玩家名称: ${resolvedName}`, 'info');
+                }
+            }
+        });
+
         content.querySelector('#edit-cancel').addEventListener('click', () => Utils.hideModal());
         content.querySelector('#edit-save').addEventListener('click', async () => {
             seller.player_name = content.querySelector('#edit-name').value.trim();
-            seller.price_per_boost = parseInt(content.querySelector('#edit-price').value) || 0;
+            seller.price_per_boost = Utils.parseMoneyInput(content.querySelector('#edit-price').value);
             seller.total_points = parseInt(content.querySelector('#edit-total').value) || 0;
             seller.points_used = parseInt(content.querySelector('#edit-used').value) || 0;
             seller.notes = content.querySelector('#edit-notes').value.trim();
@@ -260,23 +441,26 @@ window.BoostPage = {
             return;
         }
 
-        if (!confirm(`确认从 ${seller.player_name} 购买1个Boost？\n价格: ${Utils.formatMoney((seller.price_per_boost || 0) * 1000)}`)) return;
+        const unitPrice = Utils.normalizeBoostPrice(seller.price_per_boost);
+        if (!confirm(`确认从 ${seller.player_name} 购买1个Boost？\n价格: ${Utils.formatMoney(unitPrice)}`)) return;
 
         // Deduct 250 points from seller
         seller.points_used = (seller.points_used || 0) + 250;
-        seller.last_updated = Date.now();
+        seller.last_purchased_at = Date.now();
+        seller.last_updated = seller.last_purchased_at;
         await DB.put('boost_sellers', seller);
 
-        // Record transaction
         await DB.put('transactions', {
             player_id: seller.player_id,
             player_name: seller.player_name,
             date: Utils.todayKey(),
             timestamp: Date.now(),
-            amount: (seller.price_per_boost || 0) * 1000,
+            amount: unitPrice,
             category: 'boost',
             note: '购买Boost'
         });
+        await Utils.reconcileBoostSellersFromTransactions();
+        this.sellers = await DB.getAll('boost_sellers');
 
         Utils.toast(`已从 ${seller.player_name} 购买1个Boost`, 'success');
         this.render();

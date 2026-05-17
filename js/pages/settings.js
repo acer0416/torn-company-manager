@@ -185,6 +185,7 @@ window.SettingsPage = {
                 </div>
             </div>
 
+
             <!-- Window -->
             <div class="card mb-6">
                 <h3 class="text-lg font-bold text-white mb-4">

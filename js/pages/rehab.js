@@ -177,7 +177,7 @@ window.RehabPage = {
             return {
                 id: emp.player_id,
                 name: `<a href="https://www.torn.com/profiles.php?XID=${emp.player_id}" target="_blank" class="text-torn-accent hover:underline">${emp.name}</a>`,
-                position: emp.position,
+                position: Utils.formatPosition(emp.position),
                 addiction: `<span class="font-bold" style="color:${addColor}">${addVal}</span>`,
                 status: statusBadge,
                 daysSince: String(daysSince),

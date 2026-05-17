@@ -77,7 +77,7 @@ window.UI = {
       const cells = headers.map(h => {
         const rawValue = row[h.key];
         if (h.render) {
-          return `<td>${h.render(h.width, rawValue, row)}</td>`;
+          return `<td>${h.render(rawValue, row, h.width)}</td>`;
         }
         return `<td>${rawValue != null ? rawValue : ''}</td>`;
       }).join('');

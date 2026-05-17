@@ -39,8 +39,10 @@ window.DashboardPage = {
 
   async _loadAndRender() {
     // 使用缓存 + 统一 API（内部处理 V1/V2 差异与回退）
+    await Utils.cacheCompanyTypesFromAPI();
     const data = await AppCache.getOrFetch('companyData', () => TornAPI.getCompanyData());
     const { profile, detailed } = data;
+    const companyTypeName = await Utils.resolveCompanyTypeName(profile, detailed);
 
     // 恢复 object 格式以兼容快照存储
     const employees = {};
@@ -74,7 +76,7 @@ window.DashboardPage = {
     }));
 
     this._renderKPIs(profile, detailed, empList);
-    this._renderInfo(profile, detailed);
+    this._renderInfo(profile, detailed, companyTypeName);
     this._renderStats(profile, detailed, empList);
     this._renderEmployees(empList);
   },
@@ -103,18 +105,14 @@ window.DashboardPage = {
     ].join('');
   },
 
-  _renderInfo(profile, detailed) {
+  _renderInfo(profile, detailed, companyTypeName) {
     const info = document.getElementById('dash-info');
-    const upgrades = detailed.upgrades || {};
     const fields = [
       ['公司名称', profile.name || 'N/A'],
-      ['公司类型', `Type ${profile.company_type || 'N/A'}`],
+      ['公司类型', companyTypeName || '未知'],
       ['公司天数', (profile.days_old || 0) + ' 天'],
       ['可用训练', detailed.trains_available ?? profile.trains ?? 'N/A'],
       ['广告预算', Utils.formatMoney(detailed.advertising_budget || 0)],
-      ['员工休息室', upgrades.staffroom_size || 'N/A'],
-      ['仓库存储', upgrades.storage_size || 'N/A'],
-      ['存储容量', (upgrades.storage_space || 0).toLocaleString()],
     ];
 
     info.innerHTML = `<h3 class="text-white font-medium mb-3"><i class="fas fa-info-circle mr-2 text-torn-blue"></i>公司信息</h3>
@@ -134,16 +132,21 @@ window.DashboardPage = {
       ? Math.round(empList.reduce((s, e) => s + (e.effectiveness?.total || 0), 0) / empList.length)
       : 0;
     const totalWages = empList.reduce((s, e) => s + (e.wage || 0), 0);
-    const activeCount = empList.filter(e => e.last_action?.status === 'Online').length;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const activeCount = empList.filter(e => {
+      const ts = e.last_action?.timestamp || 0;
+      return ts > 0 && (nowSec - ts) < 86400;
+    }).length;
     const inactiveCount = empList.filter(e => {
       const ts = e.last_action?.timestamp || 0;
-      return (Date.now() / 1000 - ts) > 86400;
+      return ts > 0 && (nowSec - ts) >= 86400;
     }).length;
+    const capacity = Math.max(1, profile.employees_capacity || detailed.employees_capacity || detailed.company_size || empList.length);
 
     stats.innerHTML = `<h3 class="text-white font-medium mb-3"><i class="fas fa-chart-bar mr-2 text-torn-gold"></i>统计概览</h3>
       <div class="space-y-3">
         ${UI.statBar('平均效能', avgEff, 100, Utils.effColor(avgEff))}
-        ${UI.statBar('在线率', activeCount, empList.length, '#4ade80', `${activeCount}/${empList.length}`)}
+        ${UI.statBar('员工活跃', activeCount, capacity, '#4ade80', `${activeCount}/${capacity} 人`)}
         <div class="grid grid-cols-2 gap-3 mt-3">
           <div><div class="text-gray-400 text-xs">总工资</div><div class="text-white font-medium">${Utils.formatMoney(totalWages)}</div></div>
           <div><div class="text-gray-400 text-xs">不活跃(>24h)</div><div class="text-red-400 font-medium">${inactiveCount} 人</div></div>

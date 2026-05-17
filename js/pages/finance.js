@@ -191,13 +191,22 @@ window.FinancePage = {
         // 如果没有快照，直接从 API 获取公司详细数据（确保概览 Tab 首次打开即显示数据）
         if (!this.latestSnapshot) {
             try {
-                const detail = await AppCache.getOrFetch('companyDetailed', () => TornAPI.getCompanyDetailed());
-                if (detail?.company_detailed) {
-                    this.latestSnapshot = { detailed: detail.company_detailed };
+                const detail = await AppCache.getOrFetch('companyDetailed', () => TornAPI.v1('profile,detailed'));
+                if (detail?.company_detailed || detail?.company) {
+                    this.latestSnapshot = {
+                        profile: detail.company || {},
+                        detailed: detail.company_detailed || {}
+                    };
                 }
             } catch (e) {
                 console.warn('[FinancePage] Failed to fetch company detailed:', e);
             }
+        }
+
+        try {
+            this._overviewStock = await AppCache.getOrFetch('stock', () => TornAPI.getStockUnified());
+        } catch (e) {
+            this._overviewStock = [];
         }
     },
 
@@ -281,15 +290,7 @@ window.FinancePage = {
             carryoverOut = balance;
         }
         
-        // 确定状态
-        var status = 'current';
-        if (balance >= 0) {
-            status = 'paid';
-        } else if (balance < 0 && weekKey < Utils.weekKey()) {
-            status = 'overdue';
-        }
-        
-        // 写入 tax_weeks
+        // 写入 tax_weeks（周状态在员工明细生成后按每人缴纳情况更新）
         var weekRecord = {
             week_key: weekKey,
             year: parseInt(weekKey.split('-W')[0], 10),
@@ -300,7 +301,7 @@ window.FinancePage = {
             employee_count: employeeCount,
             net_due: netDue,
             balance: balance,
-            status: status,
+            status: 'current',
             calculated_at: Date.now()
         };
         
@@ -453,7 +454,51 @@ window.FinancePage = {
         // 刷新内存中的 employeeTaxList
         self.employeeTaxList = await DB.getAll('employee_tax') || [];
 
+        weekRecord.status = self._computeWeekTaxStatusFromEmployees(weekKey);
+        await DB.put('tax_weeks', weekRecord);
+        var weekIdx = self.taxWeeks.findIndex(function(w) { return w.week_key === weekKey; });
+        if (weekIdx >= 0) self.taxWeeks[weekIdx] = weekRecord;
+
         return weekRecord;
+    },
+
+    /** 周税务状态：按每位在职员工是否缴清（含销账），而非总额对比 */
+    _computeWeekTaxStatusFromEmployees: function(weekKey) {
+        if (!this.config || !this.config.weekly_tax_enabled) return 'current';
+
+        var records = (this.employeeTaxList || []).filter(function(r) {
+            return r.week_key === weekKey;
+        });
+        var activeEmployees = (this.employees || []).filter(function(emp) {
+            return emp.left_date === null || emp.left_date === undefined;
+        });
+
+        var needPay = 0;
+        var resolved = 0;
+
+        for (var i = 0; i < activeEmployees.length; i++) {
+            var emp = activeEmployees[i];
+            var pid = String(emp.player_id);
+            var row = records.find(function(r) { return String(r.player_id) === pid; });
+            var taxAmt = row != null ? Number(row.tax_amount) : this._getEmployeeTaxRate(pid);
+            if (taxAmt <= 0) continue;
+            needPay++;
+            var paidAmt = row ? Number(row.paid_amount) || 0 : 0;
+            var writtenOff = row && row.is_written_off === true;
+            if (writtenOff || paidAmt >= taxAmt) resolved++;
+        }
+
+        if (needPay === 0) return 'paid';
+        if (resolved >= needPay) return 'paid';
+        if (weekKey < Utils.weekKey()) return 'overdue';
+        return 'current';
+    },
+
+    _refreshWeekTaxStatus: async function(weekKey) {
+        var weekRecord = this.taxWeeks.find(function(w) { return w.week_key === weekKey; });
+        if (!weekRecord) return;
+        weekRecord.status = this._computeWeekTaxStatusFromEmployees(weekKey);
+        await DB.put('tax_weeks', weekRecord);
     },
 
     // 确保周记录存在，不存在则计算
@@ -898,10 +943,7 @@ window.FinancePage = {
 
     _overviewTabHTML() {
         const now = new Date();
-        const dayOfWeek = now.getDay() || 7; // 1-7 (Mon-Sun)
-        const startOfWeek = new Date(now);
-        startOfWeek.setDate(now.getDate() - dayOfWeek + 1);
-        startOfWeek.setHours(0, 0, 0, 0);
+        const startOfWeek = Utils.startOfCalendarWeek(now);
 
         const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
@@ -927,22 +969,11 @@ window.FinancePage = {
             }
         }
 
-        // Get API data from snapshot
-        const detailed = this.latestSnapshot?.detailed || {};
-        const dailyIncome = detailed.daily_income || 0;
-        const dailyAdFee = detailed.advertising_budget || 0;
-        
-        let dailyCost = detailed.daily_cost_of_goods || 0;
-        if (!dailyCost && detailed.daily_income && detailed.daily_profit) {
-            const wages = detailed.daily_wages || 0;
-            dailyCost = Math.max(0, detailed.daily_income - detailed.daily_profit - dailyAdFee - wages);
-        }
+        const fin = Utils.resolveCompanyFinancials(this.latestSnapshot, this._overviewStock || []);
+        const weekIncomeAPI = fin.weekIncome;
+        const weekCostAPI = fin.weekCost;
+        const weekAdFeeAPI = fin.weekAdFee;
 
-        // Calculate Weekly
-        const weekIncomeAPI = dailyIncome * 7;
-        const weekAdFeeAPI = dailyAdFee * 7;
-        const weekCostAPI = dailyCost * 7;
-        
         const weekTotalIncome = weekTax + weekTrain + weekOther + weekIncomeAPI;
         const weekTotalExpense = weekBoost + weekCostAPI + weekAdFeeAPI;
         const weekNetProfit = weekTotalIncome - weekTotalExpense;
@@ -959,7 +990,7 @@ window.FinancePage = {
                 </h3>
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
                     ${UI.kpiCard('fas fa-arrow-down', '总支出', Utils.formatMoney(weekTotalExpense), '成本+广告+Boost', 'red')}
-                    ${UI.kpiCard('fas fa-arrow-up', '总收入', Utils.formatMoney(weekTotalIncome), '税费+训练+其他+日收入', 'green')}
+                    ${UI.kpiCard('fas fa-arrow-up', '总收入', Utils.formatMoney(weekTotalIncome), '税费+训练+其他+公司周收入', 'green')}
                     ${UI.kpiCard('fas fa-balance-scale', '净利润', Utils.formatMoney(weekNetProfit), '收入 - 支出', weekNetProfit >= 0 ? 'accent' : 'red')}
                 </div>
 
@@ -1000,7 +1031,7 @@ window.FinancePage = {
                                 <span class="font-mono text-white">${Utils.formatMoney(weekOther)}</span>
                             </div>
                             <div class="flex justify-between text-gray-300">
-                                <span>公司日收入预估 (API):</span>
+                                <span>公司收入 (API 周):</span>
                                 <span class="font-mono text-white">${Utils.formatMoney(weekIncomeAPI)}</span>
                             </div>
                         </div>
@@ -1054,9 +1085,7 @@ window.FinancePage = {
 
         const now = new Date();
         if (this.txFilterTime === 'week') {
-            const startOfWeek = new Date(now);
-            startOfWeek.setDate(now.getDate() - (now.getDay() || 7) + 1);
-            startOfWeek.setHours(0, 0, 0, 0);
+            const startOfWeek = Utils.startOfCalendarWeek(now);
             filteredTx = filteredTx.filter(t => {
                 let ts = t.timestamp || 0;
                 if (ts > 0 && ts < 100000000000) ts *= 1000;
@@ -1076,10 +1105,8 @@ window.FinancePage = {
         const rows = sortedTx.map(tx => {
             const cat = tx.category || 'other';
             const catSelect = `
-                <select class="input input-xs bg-torn-surface border border-torn-border cursor-pointer tx-cat-select max-w-[80px]" data-tx-id="${tx.id}">
-                    <option value="train" ${cat === 'train' ? 'selected' : ''}>训练</option>
-                    <option value="tax" ${cat === 'tax' ? 'selected' : ''}>税务</option>
-                    <option value="other" ${cat === 'other' ? 'selected' : ''}>其他</option>
+                <select class="input input-xs bg-torn-surface border border-torn-border cursor-pointer tx-cat-select max-w-[88px]" data-tx-id="${tx.id}">
+                    ${Utils.transactionCategoryOptions(cat)}
                 </select>
             `;
             return {
@@ -1087,7 +1114,7 @@ window.FinancePage = {
                 id: tx.id,
                 date: tx.date || '-',
                 employee: tx.player_name || '-',
-                amount: Utils.formatMoney(tx.amount || 0),
+                amount: Utils.formatTransactionAmount(tx),
                 category: catSelect,
                 note: tx.note
                     ? `<span class="truncate block max-w-[200px]" title="${tx.note.replace(/"/g, '"')}">${tx.note}</span>`
@@ -1167,7 +1194,7 @@ window.FinancePage = {
         var carryoverIn = weekRecord ? (Number(weekRecord.carryover_in) || 0) : 0;
         var netDue = weekRecord ? (Number(weekRecord.net_due) || 0) : 0;
         var balance = weekRecord ? (Number(weekRecord.balance) || 0) : 0;
-        var status = weekRecord ? weekRecord.status : 'current';
+        var status = weekRecord ? self._computeWeekTaxStatusFromEmployees(self.selectedWeekKey) : 'current';
         var employeeCount = weekRecord ? weekRecord.employee_count : 0;
 
         var statusText = status === 'paid' ? '已缴清' : (status === 'overdue' ? '未缴清' : '进行中');
@@ -1282,7 +1309,7 @@ window.FinancePage = {
         var statusDotColor = 'text-gray-400';
         var statusText = '无数据';
         if (weekRecord) {
-            switch (weekRecord.status) {
+            switch (self._computeWeekTaxStatusFromEmployees(self.selectedWeekKey)) {
                 case 'paid':
                     statusDotColor = 'text-green-400';
                     statusText = '已缴清';
@@ -1672,15 +1699,18 @@ window.FinancePage = {
         };
         c.addEventListener('click', this._clickHandler);
 
-        // Tab switching via tabNav (uses data-tab attribute)
-        if (this._tabHandler) c.removeEventListener('click', this._tabHandler);
-        this._tabHandler = (e) => {
-            const tabItem = e.target.closest('.tab-item[data-tab]');
-            if (!tabItem) return;
-            this.activeTab = tabItem.dataset.tab;
-            this.render();
-        };
-        c.addEventListener('click', this._tabHandler);
+        // Tab switching via tabNav (scoped to finance-tabs to prevent cross-page event leak)
+        const tabContainer = document.getElementById('finance-tabs');
+        if (tabContainer) {
+            if (this._tabHandler) tabContainer.removeEventListener('click', this._tabHandler);
+            this._tabHandler = (e) => {
+                const tabItem = e.target.closest('.tab-item[data-tab]');
+                if (!tabItem) return;
+                this.activeTab = tabItem.dataset.tab;
+                this.render();
+            };
+            tabContainer.addEventListener('click', this._tabHandler);
+        }
 
         // Init sortable tables
         UI.initSortable('transactions-table');
@@ -1727,6 +1757,7 @@ window.FinancePage = {
             rec.calculated_at = Date.now();
             await DB.put('employee_tax', rec);
         }
+        await this._refreshWeekTaxStatus(weekKey);
         Utils.toast('已标记为销账', 'success');
         this.render();
     },
@@ -1742,6 +1773,7 @@ window.FinancePage = {
             rec.calculated_at = Date.now();
             await DB.put('employee_tax', rec);
         }
+        await this._refreshWeekTaxStatus(weekKey);
         Utils.toast('已取消销账', 'info');
         this.render();
     },
@@ -1826,7 +1858,11 @@ window.FinancePage = {
 
     async _deleteTx(txId) {
         if (!confirm('确定删除此交易？')) return;
+        const tx = this.transactions.find(t => Number(t.id) === Number(txId));
         await DB.delete('transactions', txId);
+        if (tx?.category === 'boost') {
+            await Utils.reconcileBoostSellersFromTransactions();
+        }
         Utils.toast('交易已删除', 'info');
         await this.render();
     },
@@ -1839,10 +1875,14 @@ window.FinancePage = {
         }
         if (!confirm(`确定要删除选中的 ${checkboxes.length} 条记录吗？`)) return;
         
+        let hadBoost = false;
         for (const cb of checkboxes) {
             const txId = Number(cb.dataset.txId);
+            const tx = this.transactions.find(t => Number(t.id) === txId);
+            if (tx?.category === 'boost') hadBoost = true;
             await DB.delete('transactions', txId);
         }
+        if (hadBoost) await Utils.reconcileBoostSellersFromTransactions();
         Utils.toast(`已成功删除 ${checkboxes.length} 条记录`, 'success');
         await this.render();
     },
@@ -1862,9 +1902,7 @@ window.FinancePage = {
                 <div class="mb-6">
                     <label class="text-gray-400 text-sm mb-1 block">目标分类</label>
                     <select class="input" id="bulk-edit-cat">
-                        <option value="train">训练 (train)</option>
-                        <option value="tax">税务 (tax)</option>
-                        <option value="other">其他 (other)</option>
+                        ${Utils.transactionCategoryOptions('other')}
                     </select>
                 </div>
                 <div class="flex justify-end gap-2">
@@ -1947,8 +1985,9 @@ window.FinancePage = {
                         剩余: <span class="text-torn-green font-mono">${Utils.formatMoney(remaining)}</span>
                     </div>
                     <select class="input input-xs bg-torn-surface border border-torn-border split-remainder-cat" style="max-width:100px">
-                        <option value="train">train</option>
-                        <option value="other">other</option>
+                        <option value="train" selected>训练</option>
+                        <option value="boost">Boost</option>
+                        <option value="other">其他</option>
                     </select>
                     <input type="hidden" class="split-remainder-amount" value="${remaining}" />
                 </div>
@@ -2093,9 +2132,7 @@ window.FinancePage = {
                     <div>
                         <label class="text-gray-400 text-sm mb-1 block">分类</label>
                         <select class="input" id="modal-tx-cat">
-                            <option value="train">训练 (train)</option>
-                            <option value="tax">税务 (tax)</option>
-                            <option value="other">其他 (other)</option>
+                            ${Utils.transactionCategoryOptions('other')}
                         </select>
                     </div>
                     <div>
@@ -2153,9 +2190,7 @@ window.FinancePage = {
                     <div>
                         <label class="text-gray-400 text-sm mb-1 block">分类</label>
                         <select class="input" id="modal-edit-cat">
-                            <option value="train" ${tx.category === 'train' ? 'selected' : ''}>训练 (train)</option>
-                            <option value="tax" ${tx.category === 'tax' ? 'selected' : ''}>税务 (tax)</option>
-                            <option value="other" ${tx.category === 'other' ? 'selected' : ''}>其他 (other)</option>
+                            ${Utils.transactionCategoryOptions(tx.category || 'other')}
                         </select>
                     </div>
                     <div>
@@ -2341,9 +2376,7 @@ window.FinancePage = {
                 <div class="flex-1">
                     <label class="text-gray-400 text-xs block">分类</label>
                     <select class="input input-sm split-cat">
-                        <option value="train">train</option>
-                        <option value="tax">tax</option>
-                        <option value="other">other</option>
+                        ${Utils.transactionCategoryOptions('train')}
                     </select>
                 </div>
                 <div class="flex-1">
@@ -2780,9 +2813,7 @@ window.FinancePage = {
 
         const now = new Date();
         if (this.adFilterTime === 'week') {
-            const startOfWeek = new Date(now);
-            startOfWeek.setDate(now.getDate() - (now.getDay() || 7) + 1);
-            startOfWeek.setHours(0, 0, 0, 0);
+            const startOfWeek = Utils.startOfCalendarWeek(now);
             filtered = filtered.filter(item => (item.entry.timestamp || 0) >= startOfWeek.getTime() / 1000);
         } else if (this.adFilterTime === 'month') {
             const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
