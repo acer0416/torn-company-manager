@@ -166,12 +166,24 @@
    */
   function parseTrainingTable() {
     const entries = [];
+    // 使用 playerId + rawText 指纹去重，防止嵌套 DOM 导致同一条记录被多次解析
+    const seen = new Set();
+
+    function addEntry(entry) {
+      if (!entry) return;
+      // 基于 playerId + rawText 前 80 字符生成去重指纹
+      const fingerprint = `${entry.playerId || 'no-id'}|${(entry.rawText || '').substring(0, 80)}`;
+      if (seen.has(fingerprint)) return;
+      seen.add(fingerprint);
+      entries.push(entry);
+    }
 
     // 策略1: 查找表格行
     const rows = document.querySelectorAll('table tr, [class*="table"] [class*="row"], [class*="newsItem"]');
     for (const row of rows) {
       const text = row.textContent || '';
-      const entry = parseTrainingText(text);
+      const html = row.innerHTML || '';
+      const entry = parseTrainingText(text, html);
       if (entry) {
         // 尝试提取时间戳
         const timeEl = row.querySelector('time, [class*="time"], [class*="date"], [data-time]');
@@ -181,16 +193,26 @@
           const ts = Date.parse(dt);
           if (!isNaN(ts)) entry.timestamp = ts;
         }
-        entries.push(entry);
+        // 直接从 DOM 中查找玩家链接提取 XID
+        const playerLink = row.querySelector('a[href*="XID="]');
+        if (playerLink) {
+          const href = playerLink.getAttribute('href') || '';
+          const xidMatch = href.match(/XID=(\d+)/i);
+          if (xidMatch) {
+            entry.playerId = xidMatch[1];
+            entry.rawText = (entry.rawText || '') + ' XID=' + xidMatch[1];
+          }
+        }
+        addEntry(entry);
       }
     }
-
     // 策略2: 如果表格行没找到，查找列表项
     if (entries.length === 0) {
       const listItems = document.querySelectorAll('li, [class*="listItem"], [class*="entry"]');
       for (const item of listItems) {
         const text = item.textContent || '';
-        const entry = parseTrainingText(text);
+        const html = item.innerHTML || '';
+        const entry = parseTrainingText(text, html);
         if (entry) {
           const timeEl = item.querySelector('time, [class*="time"], [class*="date"]');
           if (timeEl) {
@@ -199,7 +221,16 @@
             const ts = Date.parse(dt);
             if (!isNaN(ts)) entry.timestamp = ts;
           }
-          entries.push(entry);
+          const playerLink = item.querySelector('a[href*="XID="]');
+          if (playerLink) {
+            const href = playerLink.getAttribute('href') || '';
+            const xidMatch = href.match(/XID=(\d+)/i);
+            if (xidMatch) {
+              entry.playerId = xidMatch[1];
+              entry.rawText = (entry.rawText || '') + ' XID=' + xidMatch[1];
+            }
+          }
+          addEntry(entry);
         }
       }
     }
@@ -210,9 +241,19 @@
       for (const div of allDivs) {
         const text = div.textContent || '';
         if (text.length > 20 && text.length < 500 && /\btrained\b/i.test(text)) {
-          const entry = parseTrainingText(text);
-          if (entry && !entries.some(e => e.playerName === entry.playerName && e.rawText === entry.rawText)) {
-            entries.push(entry);
+          const html = div.innerHTML || '';
+          const entry = parseTrainingText(text, html);
+          if (entry) {
+            const playerLink = div.querySelector('a[href*="XID="]');
+            if (playerLink) {
+              const href = playerLink.getAttribute('href') || '';
+              const xidMatch = href.match(/XID=(\d+)/i);
+              if (xidMatch) {
+                entry.playerId = xidMatch[1];
+                entry.rawText = (entry.rawText || '') + ' XID=' + xidMatch[1];
+              }
+            }
+            addEntry(entry);
           }
         }
       }
@@ -229,17 +270,40 @@
    * - "You trained PlayerName"
    * - "PlayerName was trained"
    */
-  function parseTrainingText(text) {
+  /**
+   * 剥离 Torn 职位前缀，如 "Store Manager Young-Saucekage" → "Young-Saucekage"
+   */
+  function stripJobTitle(name) {
+    if (!name) return name;
+    // 常见 Torn 公司职位前缀（按长度降序排列，优先匹配长的）
+    const titles = [
+      'Store Manager', 'Salesperson', 'Marketing Director', 'Operations Director',
+      'Finance Director', 'Human Resources Director', 'Cleaner', 'Secretary',
+      'Lingerie Model', 'Manager', 'Director', 'Supervisor', 'Assistant',
+      'Janitor', 'Clerk', 'Intern', 'Trainee'
+    ];
+    let result = name.trim();
+    for (const title of titles) {
+      if (result.toLowerCase().startsWith(title.toLowerCase() + ' ')) {
+        result = result.substring(title.length + 1).trim();
+        break;
+      }
+    }
+    return result;
+  }
+
+  function parseTrainingText(text, html) {
     if (!text || typeof text !== 'string') return null;
 
     const cleaned = text.replace(/\s+/g, ' ').trim();
 
     // 模式1: "X has been trained by Y" 或 "X has been trained"
-    const trainedByRe = /(.+?)\s+has\s+been\s+trained(?:\s+by\s+(.+?))?(?:\.|$)/i;
+    // trainer 捕获组使用 [a-zA-Z\s]+ 只匹配字母和空格，避免捕获时间戳和按钮文本
+    const trainedByRe = /(.+?)\s+has\s+been\s+trained(?:\s+by\s+([a-zA-Z\s]+?))?\s*(?:\d|Copy|Save|$)/i;
     let match = cleaned.match(trainedByRe);
     if (match) {
       return {
-        playerName: match[1].trim(),
+        playerName: stripJobTitle(match[1].trim()),
         trainer: (match[2] || 'director').trim(),
         action: 'trained',
         rawText: cleaned
@@ -247,23 +311,23 @@
     }
 
     // 模式2: "Y has trained X" 或 "Y trained X"
-    const hasTrainedRe = /(.+?)\s+(?:has\s+)?trained\s+(.+?)(?:\.|$)/i;
+    const hasTrainedRe = /([a-zA-Z\s]+?)\s+(?:has\s+)?trained\s+(.+?)(?:\s*\d|Copy|Save|$)/i;
     match = cleaned.match(hasTrainedRe);
     if (match) {
       return {
-        playerName: match[2].trim(),
+        playerName: stripJobTitle(match[2].trim()),
         trainer: match[1].trim(),
         action: 'trained',
         rawText: cleaned
       };
     }
 
-    // 模式3: "You trained X"
-    const youTrainedRe = /(?:You|Director)\s+trained\s+(.+?)(?:\.|$)/i;
+    // 模式3: "You trained X" 或 "Director trained X"
+    const youTrainedRe = /(?:You|Director)\s+trained\s+(.+?)(?:\s*\d|Copy|Save|$)/i;
     match = cleaned.match(youTrainedRe);
     if (match) {
       return {
-        playerName: match[1].trim(),
+        playerName: stripJobTitle(match[1].trim()),
         trainer: 'director',
         action: 'trained',
         rawText: cleaned
@@ -271,11 +335,11 @@
     }
 
     // 模式4: "X was trained"
-    const wasTrainedRe = /(.+?)\s+was\s+trained(?:\s+by\s+(.+?))?(?:\.|$)/i;
+    const wasTrainedRe = /(.+?)\s+was\s+trained(?:\s+by\s+([a-zA-Z\s]+?))?\s*(?:\d|Copy|Save|$)/i;
     match = cleaned.match(wasTrainedRe);
     if (match) {
       return {
-        playerName: match[1].trim(),
+        playerName: stripJobTitle(match[1].trim()),
         trainer: (match[2] || 'director').trim(),
         action: 'trained',
         rawText: cleaned

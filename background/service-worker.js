@@ -443,13 +443,12 @@ async function getTrainingSnapshot() {
     });
     db.close();
 
-    // 返回最新的快照
-    if (all.length === 0) {
-      return { ok: true, snapshot: null };
+    if (all.length > 0) {
+      all.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      return { ok: true, snapshot: all[0] };
     }
 
-    all.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-    return { ok: true, snapshot: all[0] };
+    return { ok: true, snapshot: null };
   } catch (err) {
     return { ok: false, error: err.message };
   }

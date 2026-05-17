@@ -79,11 +79,14 @@ window.TrainingPage = {
             this._trainsAvailable = '-';
         }
 
-        try {
-            this._apiTrainCounts = await TornAPI.getWeeklyEmployeeTrainCounts();
-        } catch (e) {
-            console.warn('[TrainingPage] getWeeklyEmployeeTrainCounts:', e.message);
-            this._apiTrainCounts = {};
+        // 如果 _refetchTrainData 已通过 content script 设置了训练计数，跳过 API 调用
+        if (!this._skipApiTrainCounts) {
+            try {
+                this._apiTrainCounts = await TornAPI.getWeeklyEmployeeTrainCounts();
+            } catch (e) {
+                console.warn('[TrainingPage] getWeeklyEmployeeTrainCounts:', e.message);
+                this._apiTrainCounts = {};
+            }
         }
 
         // 从财务 transactions 表获取本周训练类交易（用于概览收入统计）
@@ -396,52 +399,51 @@ window.TrainingPage = {
     },
 
     async _refetchTrainData() {
-        Utils.showLoading('正在从 Torn 公司页面抓取完整训练数据...');
+      Utils.showLoading('正在从 Torn 公司页面抓取完整训练数据...');
+      try {
+        // 通过 background service worker 触发 content script 抓取
+        const result = await chrome.runtime.sendMessage({ action: 'scrapeTraining' });
+
+        if (!result || !result.ok) {
+          throw new Error(result?.error || '抓取失败');
+        }
+
+        // 抓取成功后，从 IndexedDB 读取最新快照并更新 API 计数
+        const snapshotResult = await chrome.runtime.sendMessage({ action: 'getTrainingSnapshot' });
+
+        if (snapshotResult && snapshotResult.ok && snapshotResult.snapshot) {
+          const snapshot = snapshotResult.snapshot;
+
+          // 将抓取的条目转换为 API 计数格式 { player_id: count }
+          const counts = {};
+          const entries = snapshot.entries || [];
+          for (const entry of entries) {
+            const emp = this._matchEmployee(entry);
+            if (emp) {
+              counts[emp.player_id] = (counts[emp.player_id] || 0) + 1;
+            }
+          }
+          this._apiTrainCounts = counts;
+          console.log('[TrainingPage] Scraped training data:', entries.length, 'entries, matched', Object.keys(counts).length, 'employees');
+        }
+
+        // 重新获取公司详情（更新可用训练次数）
         try {
-            // 通过 background service worker 触发 content script 抓取
-            const result = await chrome.runtime.sendMessage({ action: 'scrapeTraining' });
+          const detail = await TornAPI.getCompanyDetailed();
+          this._trainsAvailable = detail?.company_detailed?.trains_available
+            ?? detail?.trains_available
+            ?? detail?.company?.trains_available
+            ?? 0;
+        } catch (e) {
+          console.warn('[TrainingPage] refetch detailed:', e.message);
+        }
 
-            if (!result || !result.ok) {
-                throw new Error(result?.error || '抓取失败');
-            }
-
-            // 抓取成功后，从 IndexedDB 读取最新快照并更新 API 计数
-            const snapshotResult = await chrome.runtime.sendMessage({ action: 'getTrainingSnapshot' });
-
-            if (snapshotResult && snapshotResult.ok && snapshotResult.snapshot) {
-                const snapshot = snapshotResult.snapshot;
-                // 将抓取的条目转换为 API 计数格式 { player_id: count }
-                const counts = {};
-                const entries = snapshot.entries || [];
-                for (const entry of entries) {
-                    const emp = this._matchEmployee(entry);
-                    if (emp) {
-                        counts[emp.player_id] = (counts[emp.player_id] || 0) + 1;
-                    }
-                }
-                this._apiTrainCounts = counts;
-                const unmatchedCount = entries.length - Object.values(counts).reduce((s, n) => s + n, 0);
-                console.log('[TrainingPage] Scraped training data:', entries.length, 'entries, matched', Object.keys(counts).length, 'employees, unmatched', unmatchedCount);
-                if (unmatchedCount > 0) {
-                    const sampleUnmatched = entries.filter(e => !this._matchEmployee(e)).slice(0, 3);
-                    console.warn('[TrainingPage] Sample unmatched entries:', sampleUnmatched.map(e => ({ playerName: e.playerName, rawText: e.rawText?.substring(0, 80) })));
-                }
-            }
-
-            // 重新获取公司详情（更新可用训练次数）
-            try {
-                const detail = await TornAPI.getCompanyDetailed();
-                this._trainsAvailable = detail?.company_detailed?.trains_available
-                    ?? detail?.trains_available
-                    ?? detail?.company?.trains_available
-                    ?? 0;
-            } catch (e) {
-                console.warn('[TrainingPage] refetch detailed:', e.message);
-            }
-
-            Utils.hideLoading();
-            Utils.toast(`训练数据已从 Torn 页面抓取 (${result.count || 0} 条记录)`, 'success');
-            await this.render();
+        Utils.hideLoading();
+        Utils.toast(`训练数据已从 Torn 页面抓取 (${result.count || 0} 条记录)`, 'success');
+        // 使用 _skipApiTrainCounts 标志防止 render → _loadData 覆盖 scraper 数据
+        this._skipApiTrainCounts = true;
+        await this.render();
+        this._skipApiTrainCounts = false;
         } catch (e) {
             Utils.hideLoading();
             // 如果 content script 抓取失败，回退到 API 方式
@@ -478,51 +480,79 @@ window.TrainingPage = {
      * @param {Object} entry - { playerName, trainer, action, rawText }
      * @returns {Object|null} 匹配的员工对象或 null
      */
+    /**
+     * 剥离 Torn 职位前缀（与 content script 的 stripJobTitle 保持一致）
+     */
+    _stripJobTitle(name) {
+      if (!name) return name;
+      const titles = [
+        'Store Manager', 'Salesperson', 'Marketing Director', 'Operations Director',
+        'Finance Director', 'Human Resources Director', 'Cleaner', 'Secretary',
+        'Lingerie Model', 'Manager', 'Director', 'Supervisor', 'Assistant',
+        'Janitor', 'Clerk', 'Intern', 'Trainee'
+      ];
+      let result = name.trim();
+      for (const title of titles) {
+        if (result.toLowerCase().startsWith(title.toLowerCase() + ' ')) {
+          result = result.substring(title.length + 1).trim();
+          break;
+        }
+      }
+      return result;
+    },
+  
     _matchEmployee(entry) {
-        if (!entry || !this.employees.length) return null;
+      if (!entry || !this.employees.length) return null;
 
-        // 策略1: 从 rawText 中提取 XID= 格式的玩家 ID（Torn news HTML 格式）
-        if (entry.rawText) {
-            const xidMatch = entry.rawText.match(/XID=(\d+)/i);
-            if (xidMatch) {
-                const pid = String(xidMatch[1]);
-                const emp = this.employees.find(e => String(e.player_id) === pid);
-                if (emp) return emp;
-            }
+      // 策略1: 从 rawText 中提取 XID= 格式的玩家 ID（Torn news HTML 格式）
+      if (entry.rawText) {
+        const xidMatch = entry.rawText.match(/XID=(\d+)/i);
+        if (xidMatch) {
+          const pid = String(xidMatch[1]);
+          const emp = this.employees.find(e => String(e.player_id) === pid);
+          if (emp) return emp;
         }
+      }
 
-        // 策略2: 从 playerName 中提取 [数字] 格式的 ID
-        // 例如 "PlayerName [1234567]" → ID=1234567
-        if (entry.playerName) {
-            const bracketMatch = entry.playerName.match(/\[(\d+)\]/);
-            if (bracketMatch) {
-                const pid = String(bracketMatch[1]);
-                const emp = this.employees.find(e => String(e.player_id) === pid);
-                if (emp) return emp;
-            }
+      // 策略1b: 从 entry.playerId 直接匹配（content script 已从 DOM 提取）
+      if (entry.playerId) {
+        const pid = String(entry.playerId);
+        const emp = this.employees.find(e => String(e.player_id) === pid);
+        if (emp) return emp;
+      }
+
+      // 策略2: 从 playerName 中提取 [数字] 格式的 ID
+      if (entry.playerName) {
+        const bracketMatch = entry.playerName.match(/\[(\d+)\]/);
+        if (bracketMatch) {
+          const pid = String(bracketMatch[1]);
+          const emp = this.employees.find(e => String(e.player_id) === pid);
+          if (emp) return emp;
         }
+      }
 
-        // 策略3: 纯名称匹配（去除 [数字] 后缀）
-        if (entry.playerName) {
-            const cleanName = entry.playerName.replace(/\s*\[\d+\]\s*/, '').trim().toLowerCase();
-            if (cleanName) {
-                const emp = this.employees.find(e =>
-                    e.name && e.name.toLowerCase() === cleanName
-                );
-                if (emp) return emp;
-            }
+      // 策略3: 纯名称匹配（去除 [数字] 后缀和职位前缀）
+      if (entry.playerName) {
+        let cleanName = entry.playerName.replace(/\s*\[\d+\]\s*/, '').trim();
+        cleanName = this._stripJobTitle(cleanName).toLowerCase();
+        if (cleanName) {
+          const emp = this.employees.find(e =>
+            e.name && e.name.toLowerCase() === cleanName
+          );
+          if (emp) return emp;
         }
+      }
 
-        // 策略4: 原始 playerName 精确匹配（兼容旧格式）
-        if (entry.playerName) {
-            const emp = this.employees.find(e =>
-                e.name && entry.playerName &&
-                e.name.toLowerCase() === entry.playerName.toLowerCase()
-            );
-            if (emp) return emp;
-        }
+      // 策略4: 原始 playerName 精确匹配（兼容旧格式，剥离职位前缀）
+      if (entry.playerName) {
+        const strippedName = this._stripJobTitle(entry.playerName).toLowerCase();
+        const emp = this.employees.find(e =>
+          e.name && e.name.toLowerCase() === strippedName
+        );
+        if (emp) return emp;
+      }
 
-        return null;
+      return null;
     },
 
     _showEditModal(recordId) {
