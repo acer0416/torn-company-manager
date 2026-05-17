@@ -73,7 +73,7 @@ const TornAPI = {
   async getCompanyStock() { return this.v2('/company/stock'); },
   async getCompanyApplications() { return this.v2('/company/applications'); },
   async getCompanyDetailed() { return this.v1('detailed'); },
-  async getCompanyNews() { return this.v1('news'); },
+  async getCompanyNews() { return this.v1('news', 'company', 'limit=100'); },
   async getUserBasic() { return this.v1('basic', 'user'); },
   async getUserEvents() { return this.v1('events', 'user'); },
   async getUserLog(offset = 0) { return this.v1('log', 'user', `offset=${offset}`); },

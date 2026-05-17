@@ -113,6 +113,9 @@ window.TrainingPage = {
                     <button class="btn btn-primary" data-action="add-record">
                         <i class="fas fa-plus"></i> 添加记录
                     </button>
+                    <button class="btn btn-accent" data-action="refetch-train-data">
+                        <i class="fas fa-cloud-download-alt"></i> 重新拉取训练数据
+                    </button>
                     <button class="btn btn-secondary" data-action="refresh">
                         <i class="fas fa-sync-alt"></i> 刷新
                     </button>
@@ -314,6 +317,9 @@ window.TrainingPage = {
                     case 'refresh':
                         await this.render();
                         break;
+                    case 'refetch-train-data':
+                        await this._refetchTrainData();
+                        break;
                     case 'add-record':
                         this.showAddModal();
                         break;
@@ -382,9 +388,35 @@ window.TrainingPage = {
 
     async _deleteRecord(recordId) {
         if (!confirm('确定删除此训练记录？')) return;
-        await DB.delete('training_records', recordId);
+        // training_records store uses autoIncrement (numeric key), but dataset values are strings
+        await DB.delete('training_records', Number(recordId));
         Utils.toast('记录已删除', 'info');
         await this.render();
+    },
+
+    async _refetchTrainData() {
+        Utils.showLoading('正在从 Torn API 重新拉取训练数据...');
+        try {
+            // 重新获取公司新闻并解析训练计数
+            this._apiTrainCounts = await TornAPI.getWeeklyEmployeeTrainCounts();
+            // 重新获取公司详情（更新可用训练次数）
+            try {
+                const detail = await TornAPI.getCompanyDetailed();
+                this._trainsAvailable = detail?.company_detailed?.trains_available
+                    ?? detail?.trains_available
+                    ?? detail?.company?.trains_available
+                    ?? 0;
+            } catch (e) {
+                console.warn('[TrainingPage] refetch detailed:', e.message);
+            }
+            Utils.hideLoading();
+            Utils.toast('训练数据已重新拉取', 'success');
+            await this.render();
+        } catch (e) {
+            Utils.hideLoading();
+            Utils.toast(`拉取训练数据失败: ${e.message}`, 'error');
+            console.error('[TrainingPage] _refetchTrainData:', e);
+        }
     },
 
     _showEditModal(recordId) {
