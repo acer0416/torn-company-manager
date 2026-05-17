@@ -285,6 +285,7 @@ async function scrapeTrainingFromPage() {
   });
 
   let targetTab = null;
+  let autoOpened = false;
 
   if (tabs.length > 0) {
     // 优先使用活跃的 tab
@@ -293,32 +294,31 @@ async function scrapeTrainingFromPage() {
   } else {
     // Step 2: 没有找到，创建新 tab
     console.log('[ScrapeTraining] No existing tab found, creating new one...');
+    autoOpened = true;
     targetTab = await chrome.tabs.create({
       url: 'https://www.torn.com/companies.php?step=your&type=1',
       active: false // 后台打开，不干扰用户
     });
+    console.log('[ScrapeTraining] Created new tab:', targetTab.id);
 
-    // 等待页面加载完成
-    await new Promise((resolve) => {
-      const listener = (tabId, changeInfo) => {
-        if (tabId === targetTab.id && changeInfo.status === 'complete') {
-          chrome.tabs.onUpdated.removeListener(listener);
-          resolve();
-        }
-      };
-      chrome.tabs.onUpdated.addListener(listener);
-      // 超时保护：30 秒
-      setTimeout(() => {
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve();
-      }, 30000);
-    });
-
-    // 额外等待确保 content script 注入并初始化
-    await new Promise(r => setTimeout(r, 2000));
+    // 等待页面加载完成（带超时）
+    const loadResult = await waitForTabLoad(targetTab.id, 30000);
+    if (!loadResult.ok) {
+      throw new Error(`自动打开的 Torn 页面加载超时（${loadResult.elapsed}ms），请检查网络连接或手动打开 Torn 公司页面后重试。`);
+    }
+    console.log('[ScrapeTraining] Tab loaded in', loadResult.elapsed, 'ms');
   }
 
-  // Step 3: 向 content script 发送抓取命令
+  // Step 3: 等待 content script 就绪（使用 ping 确认）
+  const pingResult = await waitForContentScript(targetTab.id, 15000);
+  if (!pingResult.ok) {
+    if (autoOpened) {
+      throw new Error('Content script 注入超时，请刷新 Torn 公司页面后重试。');
+    }
+    throw new Error('Content script 未就绪，请刷新 Torn 公司页面后重试。');
+  }
+
+  // Step 4: 向 content script 发送抓取命令
   try {
     const response = await chrome.tabs.sendMessage(targetTab.id, {
       action: 'scrape-training-data'
@@ -328,8 +328,10 @@ async function scrapeTrainingFromPage() {
       throw new Error(response?.error || 'Content script 返回错误');
     }
 
-    // Step 4: 存入 IndexedDB
+    // Step 5: 存入 IndexedDB
     await saveTrainingSnapshot(response.data);
+
+    console.log('[ScrapeTraining] Successfully scraped', response.data.count, 'entries');
 
     return {
       ok: true,
@@ -338,10 +340,68 @@ async function scrapeTrainingFromPage() {
       source: response.data.source
     };
   } catch (err) {
-    // 如果 content script 未响应，可能是页面还没准备好
     console.error('[ScrapeTraining] Failed to communicate with content script:', err);
-    throw new Error(`无法与 Torn 页面通信: ${err.message}。请确保 Torn 公司页面已打开并登录。`);
+    if (autoOpened) {
+      throw new Error(`训练数据抓取失败: ${err.message}（已自动打开 Torn 公司页面，请检查是否已登录）`);
+    }
+    throw new Error(`训练数据抓取失败: ${err.message}。请确保 Torn 公司页面已打开并登录。`);
   }
+}
+
+/**
+ * 等待 tab 页面加载完成
+ * @param {number} tabId
+ * @param {number} timeoutMs 超时毫秒数
+ * @returns {Promise<{ok: boolean, elapsed: number}>}
+ */
+function waitForTabLoad(tabId, timeoutMs) {
+  const startTime = Date.now();
+  return new Promise((resolve) => {
+    let resolved = false;
+    const listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId === tabId && changeInfo.status === 'complete') {
+        resolved = true;
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve({ ok: true, elapsed: Date.now() - startTime });
+      }
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+
+    // 超时保护
+    setTimeout(() => {
+      if (!resolved) {
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve({ ok: false, elapsed: Date.now() - startTime });
+      }
+    }, timeoutMs);
+  });
+}
+
+/**
+ * 等待 content script 注入并就绪（通过 ping 确认）
+ * @param {number} tabId
+ * @param {number} timeoutMs 超时毫秒数
+ * @returns {Promise<{ok: boolean, elapsed: number}>}
+ */
+async function waitForContentScript(tabId, timeoutMs) {
+  const startTime = Date.now();
+  const pollInterval = 500;
+
+  while (Date.now() - startTime < timeoutMs) {
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, { action: 'ping' });
+      if (response && response.ok) {
+        console.log('[ScrapeTraining] Content script ping OK after', Date.now() - startTime, 'ms');
+        return { ok: true, elapsed: Date.now() - startTime };
+      }
+    } catch (e) {
+      // Content script 尚未就绪，继续等待
+    }
+    await new Promise(r => setTimeout(r, pollInterval));
+  }
+
+  console.warn('[ScrapeTraining] Content script ping timed out after', timeoutMs, 'ms');
+  return { ok: false, elapsed: Date.now() - startTime };
 }
 
 /**
