@@ -396,10 +396,37 @@ window.TrainingPage = {
     },
 
     async _refetchTrainData() {
-        Utils.showLoading('正在从 Torn API 重新拉取训练数据...');
+        Utils.showLoading('正在从 Torn 公司页面抓取完整训练数据...');
         try {
-            // 重新获取公司新闻并解析训练计数
-            this._apiTrainCounts = await TornAPI.getWeeklyEmployeeTrainCounts();
+            // 通过 background service worker 触发 content script 抓取
+            const result = await chrome.runtime.sendMessage({ action: 'scrapeTraining' });
+
+            if (!result || !result.ok) {
+                throw new Error(result?.error || '抓取失败');
+            }
+
+            // 抓取成功后，从 IndexedDB 读取最新快照并更新 API 计数
+            const snapshotResult = await chrome.runtime.sendMessage({ action: 'getTrainingSnapshot' });
+
+            if (snapshotResult && snapshotResult.ok && snapshotResult.snapshot) {
+                const snapshot = snapshotResult.snapshot;
+                // 将抓取的条目转换为 API 计数格式 { player_id: count }
+                const counts = {};
+                const entries = snapshot.entries || [];
+                for (const entry of entries) {
+                    // 尝试通过 playerName 匹配员工 ID
+                    const emp = this.employees.find(e =>
+                        e.name && entry.playerName &&
+                        e.name.toLowerCase() === entry.playerName.toLowerCase()
+                    );
+                    if (emp) {
+                        counts[emp.player_id] = (counts[emp.player_id] || 0) + 1;
+                    }
+                }
+                this._apiTrainCounts = counts;
+                console.log('[TrainingPage] Scraped training data:', entries.length, 'entries, matched', Object.keys(counts).length, 'employees');
+            }
+
             // 重新获取公司详情（更新可用训练次数）
             try {
                 const detail = await TornAPI.getCompanyDetailed();
@@ -410,13 +437,34 @@ window.TrainingPage = {
             } catch (e) {
                 console.warn('[TrainingPage] refetch detailed:', e.message);
             }
+
             Utils.hideLoading();
-            Utils.toast('训练数据已重新拉取', 'success');
+            Utils.toast(`训练数据已从 Torn 页面抓取 (${result.count || 0} 条记录)`, 'success');
             await this.render();
         } catch (e) {
             Utils.hideLoading();
-            Utils.toast(`拉取训练数据失败: ${e.message}`, 'error');
-            console.error('[TrainingPage] _refetchTrainData:', e);
+            // 如果 content script 抓取失败，回退到 API 方式
+            console.warn('[TrainingPage] Content script scrape failed, falling back to API:', e.message);
+            Utils.showLoading('Content script 抓取失败，回退到 Torn API...');
+            try {
+                this._apiTrainCounts = await TornAPI.getWeeklyEmployeeTrainCounts();
+                try {
+                    const detail = await TornAPI.getCompanyDetailed();
+                    this._trainsAvailable = detail?.company_detailed?.trains_available
+                        ?? detail?.trains_available
+                        ?? detail?.company?.trains_available
+                        ?? 0;
+                } catch (e2) {
+                    console.warn('[TrainingPage] refetch detailed:', e2.message);
+                }
+                Utils.hideLoading();
+                Utils.toast('已通过 Torn API 拉取训练数据（可能不完整，仅 ~25 条）', 'warning');
+                await this.render();
+            } catch (e2) {
+                Utils.hideLoading();
+                Utils.toast(`拉取训练数据失败: ${e2.message}`, 'error');
+                console.error('[TrainingPage] _refetchTrainData fallback:', e2);
+            }
         }
     },
 

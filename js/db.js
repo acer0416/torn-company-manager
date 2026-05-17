@@ -2,7 +2,7 @@
 const DB = {
   db: null,
   DB_NAME: 'torn-company-manager',
-  DB_VERSION: 7,
+  DB_VERSION: 8,
 
   async init() {
     return new Promise((resolve, reject) => {
@@ -107,6 +107,11 @@ const DB = {
           mhStore.createIndex('player_id', 'player_id');
           mhStore.createIndex('date', 'date');
         }
+        // Training snapshots from content script scraping (v8)
+        if (!db.objectStoreNames.contains('training_snapshots')) {
+          const tsStore = db.createObjectStore('training_snapshots', { keyPath: 'id', autoIncrement: true });
+          tsStore.createIndex('date', 'date');
+        }
         // Add week_key index to existing transactions store (v3→v4 upgrade)
         if (db.objectStoreNames.contains('transactions')) {
           var txStore = e.target.transaction.objectStore('transactions');
@@ -196,7 +201,7 @@ const DB = {
       'employee_notes', 'training_records', 'training_config', 'tax_config',
       'rehab_records', 'rehab_config', 'boost_sellers', 'settings', 'employees_master',
       'tax_weeks', 'tax_carryover', 'employee_tax', 'employee_tax_rates',
-      'merit_history'];
+      'merit_history', 'training_snapshots'];
     const data = {};
     for (const store of stores) {
       data[store] = await this.getAll(store);
@@ -212,7 +217,7 @@ const DB = {
       'employee_notes', 'training_records', 'training_config', 'tax_config',
       'rehab_records', 'rehab_config', 'boost_sellers', 'settings', 'employees_master',
       'tax_weeks', 'tax_carryover', 'employee_tax', 'employee_tax_rates',
-      'merit_history'];
+      'merit_history', 'training_snapshots'];
     for (const store of stores) {
       if (data[store] && data[store].length) {
         await this.clear(store);

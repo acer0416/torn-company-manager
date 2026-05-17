@@ -200,7 +200,7 @@ async function recordRehabEvent(playerId, playerName) {
 // IndexedDB helper for service worker
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('torn-company-manager', 7);
+    const req = indexedDB.open('torn-company-manager', 8);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -252,4 +252,145 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     refreshCompanyData().then(() => sendResponse({ ok: true }));
     return true;
   }
+  if (msg.action === 'scrapeTraining') {
+    scrapeTrainingFromPage().then((result) => sendResponse(result)).catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+  if (msg.action === 'getTrainingSnapshot') {
+    getTrainingSnapshot().then((result) => sendResponse(result)).catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+  // 接收来自 content script 的抓取结果
+  if (msg.action === 'trainingDataScraped') {
+    saveTrainingSnapshot(msg.data).then(() => sendResponse({ ok: true })).catch((err) => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
 });
+
+// ---- 训练数据抓取 ----
+
+/**
+ * 从 Torn 公司页面抓取训练数据
+ * 流程：
+ * 1. 查找已打开的 Torn 公司页面 tab
+ * 2. 如果没找到，打开一个新 tab
+ * 3. 向该 tab 的 content script 发送 scrape-training-data 消息
+ * 4. content script 在页面上点击 Training 按钮并解析数据
+ * 5. 将结果存入 IndexedDB
+ */
+async function scrapeTrainingFromPage() {
+  // Step 1: 查找已打开的 Torn 公司页面
+  let tabs = await chrome.tabs.query({
+    url: 'https://www.torn.com/companies.php*'
+  });
+
+  let targetTab = null;
+
+  if (tabs.length > 0) {
+    // 优先使用活跃的 tab
+    targetTab = tabs.find(t => t.active) || tabs[0];
+    console.log('[ScrapeTraining] Found existing tab:', targetTab.id, targetTab.url);
+  } else {
+    // Step 2: 没有找到，创建新 tab
+    console.log('[ScrapeTraining] No existing tab found, creating new one...');
+    targetTab = await chrome.tabs.create({
+      url: 'https://www.torn.com/companies.php?step=your&type=1',
+      active: false // 后台打开，不干扰用户
+    });
+
+    // 等待页面加载完成
+    await new Promise((resolve) => {
+      const listener = (tabId, changeInfo) => {
+        if (tabId === targetTab.id && changeInfo.status === 'complete') {
+          chrome.tabs.onUpdated.removeListener(listener);
+          resolve();
+        }
+      };
+      chrome.tabs.onUpdated.addListener(listener);
+      // 超时保护：30 秒
+      setTimeout(() => {
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }, 30000);
+    });
+
+    // 额外等待确保 content script 注入并初始化
+    await new Promise(r => setTimeout(r, 2000));
+  }
+
+  // Step 3: 向 content script 发送抓取命令
+  try {
+    const response = await chrome.tabs.sendMessage(targetTab.id, {
+      action: 'scrape-training-data'
+    });
+
+    if (!response || !response.ok) {
+      throw new Error(response?.error || 'Content script 返回错误');
+    }
+
+    // Step 4: 存入 IndexedDB
+    await saveTrainingSnapshot(response.data);
+
+    return {
+      ok: true,
+      count: response.data.count,
+      scrapedAt: response.data.scrapedAt,
+      source: response.data.source
+    };
+  } catch (err) {
+    // 如果 content script 未响应，可能是页面还没准备好
+    console.error('[ScrapeTraining] Failed to communicate with content script:', err);
+    throw new Error(`无法与 Torn 页面通信: ${err.message}。请确保 Torn 公司页面已打开并登录。`);
+  }
+}
+
+/**
+ * 将抓取的训练数据存入 IndexedDB
+ * 存储到 training_snapshots store
+ */
+async function saveTrainingSnapshot(data) {
+  const db = await openDB();
+  const tx = db.transaction('training_snapshots', 'readwrite');
+  const store = tx.objectStore('training_snapshots');
+
+  const snapshot = {
+    date: new Date().toISOString().slice(0, 10),
+    timestamp: Date.now(),
+    count: data.count || 0,
+    entries: data.entries || [],
+    source: data.source || 'unknown',
+    scrapedAt: data.scrapedAt || Date.now()
+  };
+
+  store.put(snapshot);
+  await new Promise((resolve) => { tx.oncomplete = resolve; tx.onerror = resolve; });
+  db.close();
+  console.log('[ScrapeTraining] Snapshot saved to IDB:', snapshot.count, 'entries');
+}
+
+/**
+ * 获取最新的训练快照
+ */
+async function getTrainingSnapshot() {
+  try {
+    const db = await openDB();
+    const tx = db.transaction('training_snapshots', 'readonly');
+    const store = tx.objectStore('training_snapshots');
+    const all = await new Promise((resolve) => {
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => resolve([]);
+    });
+    db.close();
+
+    // 返回最新的快照
+    if (all.length === 0) {
+      return { ok: true, snapshot: null };
+    }
+
+    all.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    return { ok: true, snapshot: all[0] };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
