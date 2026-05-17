@@ -253,11 +253,21 @@ const TornAPI = {
     return counts;
   },
 
-  /** 本周（周一至周日）各员工训练次数，来源：公司新闻 API */
+  /** 本周（周一至周日）各员工训练次数，来源：公司新闻 API。
+   *  注意：Torn API 的 company news 端点仅返回最近 25 条新闻，
+   *  不支持分页或 limit 参数。如果本周训练记录超过 25 条，
+   *  较早的记录将被截断，返回值可能不完整。
+   *  建议以本地 training_records 为主要数据源。 */
   async getWeeklyEmployeeTrainCounts() {
     const sinceMs = Utils.weekDateRange(Utils.weekKey()).start.getTime();
     const data = await this.getCompanyNews();
-    return this.parseTrainingCountsFromNews(data, sinceMs);
+    const counts = this.parseTrainingCountsFromNews(data, sinceMs);
+    const totalEntries = Object.values(data?.news || data?.company_news || {}).length;
+    console.log(`[TornAPI] getWeeklyEmployeeTrainCounts: ${totalEntries} news entries returned (Torn API limits to ~25, no pagination). Parsed ${Object.keys(counts).length} employees with training counts.`);
+    if (totalEntries >= 25) {
+      console.warn('[TornAPI] getWeeklyEmployeeTrainCounts: API returned max ~25 entries. Data may be incomplete for the full week. Use local training_records as primary source.');
+    }
+    return counts;
   },
 
   async getCompanyData() {
