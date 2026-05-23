@@ -259,6 +259,15 @@ const Utils = {
     return { start, end };
   },
 
+  // 对 weekKey 进行加减操作，返回新的 weekKey
+  // delta: 整数，正数=未来周，负数=过去周
+  weekKeyAdd(weekKey, delta) {
+    const range = this.weekDateRange(weekKey);
+    const newDate = new Date(range.start);
+    newDate.setDate(newDate.getDate() + delta * 7);
+    return this.weekKey(newDate);
+  },
+
   // 日历周起点（周一 00:00），供财务筛选等与 weekKey 对齐
   startOfCalendarWeek(date) {
     return this._mondayOfWeek(date || new Date());

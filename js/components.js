@@ -85,7 +85,17 @@ window.UI = {
     }).join('');
 
     // Store rows data on the table for re-sorting
-    const rowsJson = JSON.stringify(rows).replace(/'/g, '&#39;').replace(/</g, '&lt;');
+    // Use base64 encoding to avoid HTML special character corruption (<, >, &, etc.)
+    // NOTE: Do NOT use String.fromCharCode(...spread) on large Uint8Array — it will
+    // overflow the call stack (each byte becomes a separate argument). Use chunked
+    // apply() instead to safely handle large datasets.
+    const bytes = new TextEncoder().encode(JSON.stringify(rows));
+    const CHUNK = 8192;
+    let binaryStr = '';
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binaryStr += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    const rowsJson = btoa(binaryStr);
 
     return `
       <div class="data-table-wrapper">
@@ -197,7 +207,7 @@ window.UI = {
    */
   editableCell(value, field, recordId, type) {
     const displayValue = value != null ? value : '';
-    const escapedValue = String(displayValue).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    const escapedValue = String(displayValue).replace(/"/g, '"').replace(/'/g, '');
     return `
       <span class="editable-cell"
             data-field="${field}"
@@ -352,10 +362,10 @@ window.UI = {
     const headers = table.querySelectorAll('th[data-sortable="true"]');
     const tbody = table.querySelector('tbody');
 
-    // Parse stored rows data
+    // Parse stored rows data (base64-encoded to avoid HTML special char corruption)
     let allRows;
     try {
-      allRows = JSON.parse(table.dataset.rows || '[]');
+      allRows = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(table.dataset.rows || btoa('[]')), c => c.charCodeAt(0))));
     } catch (e) {
       allRows = [];
     }
@@ -392,25 +402,41 @@ window.UI = {
           if (valA == null) valA = '';
           if (valB == null) valB = '';
 
-          // Try numeric comparison
-          const numA = parseFloat(String(valA).replace(/[^0-9.-]/g, ''));
-          const numB = parseFloat(String(valB).replace(/[^0-9.-]/g, ''));
+          const strA = String(valA).trim();
+          const strB = String(valB).trim();
+
+          // Check for YYYY-MM-DD date format (e.g., "2026-05-21")
+          // parseFloat("2026-05-21") returns 2026 (stops at first '-'), making all dates equal.
+          // We must detect date strings and compare them as strings (lexicographic = chronological for ISO format).
+          const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+          const isDateA = dateRegex.test(strA);
+          const isDateB = dateRegex.test(strB);
+
+          if (isDateA && isDateB) {
+            // Both are dates: string comparison works correctly for ISO 8601 format
+            return direction === 'asc' ? strA.localeCompare(strB) : strB.localeCompare(strA);
+          }
+
+          // If only one is a date, dates sort after non-dates (or before, depending on direction)
+          if (isDateA) return direction === 'asc' ? 1 : -1;
+          if (isDateB) return direction === 'asc' ? -1 : 1;
+
+          // Try numeric comparison (for pure numbers, money strings like "$1,234", etc.)
+          const numA = parseFloat(strA.replace(/[^0-9.-]/g, ''));
+          const numB = parseFloat(strB.replace(/[^0-9.-]/g, ''));
 
           if (!isNaN(numA) && !isNaN(numB)) {
             return direction === 'asc' ? numA - numB : numB - numA;
           }
 
-          // String comparison
-          const strA = String(valA).toLowerCase();
-          const strB = String(valB).toLowerCase();
-          if (direction === 'asc') return strA.localeCompare(strB);
-          return strB.localeCompare(strA);
+          // String comparison (case-insensitive)
+          const lowerA = strA.toLowerCase();
+          const lowerB = strB.toLowerCase();
+          if (direction === 'asc') return lowerA.localeCompare(lowerB);
+          return lowerB.localeCompare(lowerA);
         });
 
-        // Re-render tbody
-        // We need to re-render using the original header render functions
-        // Since we can't store functions in data attributes, we re-read from the current header setup
-        // Instead, we'll just reorder the existing rows in the tbody
+        // Re-render tbody by reordering existing DOM rows
         const rowsMap = {};
         tbody.querySelectorAll('tr').forEach(tr => {
           const id = tr.dataset.id;

@@ -7,9 +7,7 @@
   "permissions": [
     "storage",
     "alarms",
-    "notifications",
-    "tabs",
-    "scripting"
+    "notifications"
   ],
   "host_permissions": [
     "https://api.torn.com/*",
@@ -32,13 +30,6 @@
   "background": {
     "service_worker": "background/service-worker.js"
   },
-  "content_scripts": [
-    {
-      "matches": ["https://www.torn.com/companies.php*"],
-      "js": ["js/content/training-scraper.js"],
-      "run_at": "document_idle"
-    }
-  ],
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",

@@ -13,5 +13,18 @@ const ALL_STORES = [
   'employee_notes', 'training_records', 'training_config', 'tax_config',
   'rehab_records', 'rehab_config', 'boost_sellers', 'company_types',
   'settings', 'employees_master', 'tax_weeks', 'tax_carryover',
-  'employee_tax', 'employee_tax_rates', 'merit_history', 'training_snapshots'
+  'employee_tax', 'employee_tax_rates', 'merit_history',
+  'train_fund_allocations'
 ];
+
+const TRAIN_CATEGORIES = [
+  { value: 'defense', label: '防御' },
+  { value: 'dexterity', label: '敏捷' },
+  { value: 'speed', label: '速度' },
+  { value: 'strength', label: '力量' },
+  { value: 'working_stats', label: '工作属性' },
+  { value: 'battle_stats', label: '战斗属性' },
+  { value: 'other', label: '其他' }
+];
+
+window.TRAIN_CATEGORIES = TRAIN_CATEGORIES;

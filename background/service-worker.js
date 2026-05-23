@@ -198,9 +198,36 @@ async function recordRehabEvent(playerId, playerName) {
 }
 
 // IndexedDB helper for service worker
+// NOTE: DB version must match js/db.js DB_VERSION (currently 9)
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('torn-company-manager', 8);
+    const req = indexedDB.open('torn-company-manager', 9);
+    req.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      const oldVersion = event.oldVersion;
+
+      console.log('[SW] IndexedDB upgrade from v' + oldVersion + ' to v' + db.version);
+
+      // Create stores if they don't exist (idempotent across upgrades)
+      if (!db.objectStoreNames.contains('snapshots')) {
+        db.createObjectStore('snapshots', { keyPath: 'date' });
+      }
+      if (!db.objectStoreNames.contains('rehab_records')) {
+        const rehabStore = db.createObjectStore('rehab_records', { keyPath: 'id', autoIncrement: true });
+        rehabStore.createIndex('player_id', 'player_id', { unique: false });
+        rehabStore.createIndex('date', 'date', { unique: false });
+      }
+      if (!db.objectStoreNames.contains('boost_sellers')) {
+        db.createObjectStore('boost_sellers', { keyPath: 'id', autoIncrement: true });
+      }
+      // Train fund allocations (v9)
+      if (!db.objectStoreNames.contains('train_fund_allocations')) {
+        const tfaStore = db.createObjectStore('train_fund_allocations', { keyPath: 'id' });
+        tfaStore.createIndex('employeeId', 'employeeId', { unique: false });
+        tfaStore.createIndex('weekKey', 'weekKey', { unique: false });
+        tfaStore.createIndex('createdAt', 'createdAt', { unique: false });
+      }
+    };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -252,204 +279,4 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     refreshCompanyData().then(() => sendResponse({ ok: true }));
     return true;
   }
-  if (msg.action === 'scrapeTraining') {
-    scrapeTrainingFromPage().then((result) => sendResponse(result)).catch((err) => sendResponse({ ok: false, error: err.message }));
-    return true;
-  }
-  if (msg.action === 'getTrainingSnapshot') {
-    getTrainingSnapshot().then((result) => sendResponse(result)).catch((err) => sendResponse({ ok: false, error: err.message }));
-    return true;
-  }
-  // 接收来自 content script 的抓取结果
-  if (msg.action === 'trainingDataScraped') {
-    saveTrainingSnapshot(msg.data).then(() => sendResponse({ ok: true })).catch((err) => sendResponse({ ok: false, error: err.message }));
-    return true;
-  }
 });
-
-// ---- 训练数据抓取 ----
-
-/**
- * 从 Torn 公司页面抓取训练数据
- * 流程：
- * 1. 查找已打开的 Torn 公司页面 tab
- * 2. 如果没找到，打开一个新 tab
- * 3. 向该 tab 的 content script 发送 scrape-training-data 消息
- * 4. content script 在页面上点击 Training 按钮并解析数据
- * 5. 将结果存入 IndexedDB
- */
-async function scrapeTrainingFromPage() {
-  // Step 1: 查找已打开的 Torn 公司页面
-  let tabs = await chrome.tabs.query({
-    url: 'https://www.torn.com/companies.php*'
-  });
-
-  let targetTab = null;
-  let autoOpened = false;
-
-  if (tabs.length > 0) {
-    // 优先使用活跃的 tab
-    targetTab = tabs.find(t => t.active) || tabs[0];
-    console.log('[ScrapeTraining] Found existing tab:', targetTab.id, targetTab.url);
-  } else {
-    // Step 2: 没有找到，创建新 tab
-    console.log('[ScrapeTraining] No existing tab found, creating new one...');
-    autoOpened = true;
-    targetTab = await chrome.tabs.create({
-      url: 'https://www.torn.com/companies.php?step=your&type=1',
-      active: false // 后台打开，不干扰用户
-    });
-    console.log('[ScrapeTraining] Created new tab:', targetTab.id);
-
-    // 等待页面加载完成（带超时）
-    const loadResult = await waitForTabLoad(targetTab.id, 30000);
-    if (!loadResult.ok) {
-      throw new Error(`自动打开的 Torn 页面加载超时（${loadResult.elapsed}ms），请检查网络连接或手动打开 Torn 公司页面后重试。`);
-    }
-    console.log('[ScrapeTraining] Tab loaded in', loadResult.elapsed, 'ms');
-  }
-
-  // Step 3: 等待 content script 就绪（使用 ping 确认）
-  const pingResult = await waitForContentScript(targetTab.id, 15000);
-  if (!pingResult.ok) {
-    if (autoOpened) {
-      throw new Error('Content script 注入超时，请刷新 Torn 公司页面后重试。');
-    }
-    throw new Error('Content script 未就绪，请刷新 Torn 公司页面后重试。');
-  }
-
-  // Step 4: 向 content script 发送抓取命令
-  try {
-    const response = await chrome.tabs.sendMessage(targetTab.id, {
-      action: 'scrape-training-data'
-    });
-
-    if (!response || !response.ok) {
-      throw new Error(response?.error || 'Content script 返回错误');
-    }
-
-    // Step 5: 存入 IndexedDB
-    await saveTrainingSnapshot(response.data);
-
-    console.log('[ScrapeTraining] Successfully scraped', response.data.count, 'entries');
-
-    return {
-      ok: true,
-      count: response.data.count,
-      scrapedAt: response.data.scrapedAt,
-      source: response.data.source
-    };
-  } catch (err) {
-    console.error('[ScrapeTraining] Failed to communicate with content script:', err);
-    if (autoOpened) {
-      throw new Error(`训练数据抓取失败: ${err.message}（已自动打开 Torn 公司页面，请检查是否已登录）`);
-    }
-    throw new Error(`训练数据抓取失败: ${err.message}。请确保 Torn 公司页面已打开并登录。`);
-  }
-}
-
-/**
- * 等待 tab 页面加载完成
- * @param {number} tabId
- * @param {number} timeoutMs 超时毫秒数
- * @returns {Promise<{ok: boolean, elapsed: number}>}
- */
-function waitForTabLoad(tabId, timeoutMs) {
-  const startTime = Date.now();
-  return new Promise((resolve) => {
-    let resolved = false;
-    const listener = (updatedTabId, changeInfo) => {
-      if (updatedTabId === tabId && changeInfo.status === 'complete') {
-        resolved = true;
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve({ ok: true, elapsed: Date.now() - startTime });
-      }
-    };
-    chrome.tabs.onUpdated.addListener(listener);
-
-    // 超时保护
-    setTimeout(() => {
-      if (!resolved) {
-        chrome.tabs.onUpdated.removeListener(listener);
-        resolve({ ok: false, elapsed: Date.now() - startTime });
-      }
-    }, timeoutMs);
-  });
-}
-
-/**
- * 等待 content script 注入并就绪（通过 ping 确认）
- * @param {number} tabId
- * @param {number} timeoutMs 超时毫秒数
- * @returns {Promise<{ok: boolean, elapsed: number}>}
- */
-async function waitForContentScript(tabId, timeoutMs) {
-  const startTime = Date.now();
-  const pollInterval = 500;
-
-  while (Date.now() - startTime < timeoutMs) {
-    try {
-      const response = await chrome.tabs.sendMessage(tabId, { action: 'ping' });
-      if (response && response.ok) {
-        console.log('[ScrapeTraining] Content script ping OK after', Date.now() - startTime, 'ms');
-        return { ok: true, elapsed: Date.now() - startTime };
-      }
-    } catch (e) {
-      // Content script 尚未就绪，继续等待
-    }
-    await new Promise(r => setTimeout(r, pollInterval));
-  }
-
-  console.warn('[ScrapeTraining] Content script ping timed out after', timeoutMs, 'ms');
-  return { ok: false, elapsed: Date.now() - startTime };
-}
-
-/**
- * 将抓取的训练数据存入 IndexedDB
- * 存储到 training_snapshots store
- */
-async function saveTrainingSnapshot(data) {
-  const db = await openDB();
-  const tx = db.transaction('training_snapshots', 'readwrite');
-  const store = tx.objectStore('training_snapshots');
-
-  const snapshot = {
-    date: new Date().toISOString().slice(0, 10),
-    timestamp: Date.now(),
-    count: data.count || 0,
-    entries: data.entries || [],
-    source: data.source || 'unknown',
-    scrapedAt: data.scrapedAt || Date.now()
-  };
-
-  store.put(snapshot);
-  await new Promise((resolve) => { tx.oncomplete = resolve; tx.onerror = resolve; });
-  db.close();
-  console.log('[ScrapeTraining] Snapshot saved to IDB:', snapshot.count, 'entries');
-}
-
-/**
- * 获取最新的训练快照
- */
-async function getTrainingSnapshot() {
-  try {
-    const db = await openDB();
-    const tx = db.transaction('training_snapshots', 'readonly');
-    const store = tx.objectStore('training_snapshots');
-    const all = await new Promise((resolve) => {
-      const req = store.getAll();
-      req.onsuccess = () => resolve(req.result || []);
-      req.onerror = () => resolve([]);
-    });
-    db.close();
-
-    if (all.length > 0) {
-      all.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-      return { ok: true, snapshot: all[0] };
-    }
-
-    return { ok: true, snapshot: null };
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
-}

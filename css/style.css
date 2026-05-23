@@ -491,3 +491,50 @@ select.input {
 .emp-tax-rate-row:hover {
   background: rgba(255, 255, 255, 0.02);
 }
+
+/* ===== 训练管理页面增强 ===== */
+
+/* 周选择器 */
+.week-selector-bar {
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+#btn-next-week:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* 批量操作栏 */
+.batch-actions-bar {
+    background: rgba(233, 69, 96, 0.08);
+    border: 1px solid rgba(233, 69, 96, 0.2);
+    border-radius: 6px;
+    padding: 8px 12px;
+}
+
+/* 记录表格中的 checkbox 列 */
+#train-records-table th:first-child,
+#train-records-table td:first-child {
+    width: 40px;
+    text-align: center;
+    padding: 8px 4px;
+}
+
+#train-records-table th:first-child input[type="checkbox"],
+#train-records-table td:first-child input[type="checkbox"] {
+    cursor: pointer;
+    accent-color: #e94560;
+}
+
+/* btn-danger 样式（批量删除按钮） */
+.btn-danger {
+    background: #dc2626;
+    color: white;
+}
+.btn-danger:hover { background: #b91c1c; }
+
+/* badge-accent 样式（当前周徽章） */
+.badge-accent {
+    background: rgba(233, 69, 96, 0.15);
+    color: #e94560;
+}

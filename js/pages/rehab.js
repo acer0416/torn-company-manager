@@ -260,6 +260,7 @@ window.RehabPage = {
         if (!this._eventsBound) {
             this._eventsBound = true;
             c.addEventListener('click', async (e) => {
+                if (Router.currentPage !== 'rehab') return;
                 const btn = e.target.closest('[data-action]');
                 if (!btn) return;
 

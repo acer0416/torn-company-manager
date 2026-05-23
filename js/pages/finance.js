@@ -22,6 +22,10 @@ window.FinancePage = {
     adFilterTime: 'week',
     itemNameCache: {},  // item ID -> name lookup
 
+    // State for train fund allocation tab
+    _trainFundAllocations: [],
+    _trainFundTabActive: false,
+
     async init() {
         await this._loadData();
         // 初始化周选择器状态
@@ -146,9 +150,11 @@ window.FinancePage = {
         const masterMap = new Map();
         (this.employees || []).forEach(emp => masterMap.set(Number(emp.player_id), emp));
 
+        const apiIds = new Set();
         for (const emp of (apiEmployees || [])) {
             const pid = Number(emp.id || emp.player_id);
             if (!pid) continue;
+            apiIds.add(pid);
             if (masterMap.has(pid)) {
                 // 更新活跃员工的最新信息
                 const existing = masterMap.get(pid);
@@ -157,7 +163,8 @@ window.FinancePage = {
                 existing.status = emp.status || existing.status;
                 existing.effectiveness = emp.effectiveness || existing.effectiveness;
                 existing.player_id = pid; // 确保 player_id 为 Number 类型
-                // 保留 employees_master 的特有字段（first_seen, last_seen, left_date）
+                // 确保 left_date 为空，因为他们还在 API 列表里
+                existing.left_date = null;
             } else {
                 // 新员工：加入列表
                 this.employees.push({
@@ -170,6 +177,17 @@ window.FinancePage = {
                     status: emp.status || {},
                     effectiveness: emp.effectiveness || {}
                 });
+            }
+        }
+
+        // 标记在 employees_master 中但不在 API 列表中的员工为离职
+        let needSyncMaster = false;
+        if (apiEmployees && apiEmployees.length > 0) {
+            for (const emp of this.employees) {
+                if (!apiIds.has(Number(emp.player_id)) && !emp.left_date) {
+                    emp.left_date = Utils.todayKey();
+                    needSyncMaster = true;
+                }
             }
         }
 
@@ -211,6 +229,18 @@ window.FinancePage = {
     },
 
     // ========== 周税务状态层函数 ==========
+
+    _getWeeklyActiveEmployees: function(weekKey) {
+        var range = Utils.weekDateRange(weekKey);
+        var weekStartStr = Utils.todayKey(range.start);
+        var weekEndStr = Utils.todayKey(range.end);
+        
+        return (this.employees || []).filter(function(emp) {
+            var firstSeen = emp.first_seen || '1970-01-01';
+            var leftDate = emp.left_date || '9999-12-31';
+            return firstSeen <= weekEndStr && leftDate >= weekStartStr;
+        });
+    },
 
     // 判断交易是否为税务类型（兼容 category 和 type 字段）
     _isTaxTx: function(tx) {
@@ -263,9 +293,7 @@ window.FinancePage = {
         }, 0);
         
         // 获取员工数（活跃员工）
-        var activeEmployees = this.employees.filter(function(emp) {
-            return emp.left_date === null || emp.left_date === undefined;
-        });
+        var activeEmployees = this._getWeeklyActiveEmployees(weekKey);
         var employeeCount = activeEmployees.length;
         
         // 计算应缴税额
@@ -284,11 +312,8 @@ window.FinancePage = {
         var balance = taxPaid - netDue;
         
         // 计算结转输出（超额部分自动结转至下周）
-        // 注意：实际 carryover 记录在员工级别重算后创建，以便附带 per_employee_surplus
+        // 注意：实际 carryoverOut 将在后续按员工计算 perEmployeeSurplus 后汇总得出
         var carryoverOut = 0;
-        if (balance > 0 && weekKey !== Utils.weekKey()) {
-            carryoverOut = balance;
-        }
         
         // 写入 tax_weeks（周状态在员工明细生成后按每人缴纳情况更新）
         var weekRecord = {
@@ -350,7 +375,7 @@ window.FinancePage = {
         }
 
         // 获取活跃员工列表
-        var empList = this.employees || [];
+        var empList = this._getWeeklyActiveEmployees(weekKey);
 
         // 合并：有交易的员工 + 活跃员工
         var allEmployeeIds = new Set();
@@ -405,20 +430,23 @@ window.FinancePage = {
         }
 
         // --- 构建 per_employee_surplus 并创建/更新自动结转记录 ---
-        if (carryoverOut > 0) {
-            // 计算每位员工在缴纳应缴后还有多少盈余（= paid - taxAmount，仅正值）
-            var perEmployeeSurplus = {};
-            var allIdsArr2 = Array.from(allEmployeeIds);
-            for (var es = 0; es < allIdsArr2.length; es++) {
-                var spid = allIdsArr2[es];
-                var spaid = paidByEmployee[spid] ? paidByEmployee[spid].paid : 0;
-                var sTaxAmount = self._getEmployeeTaxRate(spid);
-                var surplus = Math.max(0, spaid - sTaxAmount);
-                if (surplus > 0) {
-                    perEmployeeSurplus[spid] = surplus;
-                }
+        var perEmployeeSurplus = {};
+        var allIdsArr2 = Array.from(allEmployeeIds);
+        for (var es = 0; es < allIdsArr2.length; es++) {
+            var spid = allIdsArr2[es];
+            var spaid = paidByEmployee[spid] ? paidByEmployee[spid].paid : 0;
+            var sTaxAmount = self._getEmployeeTaxRate(spid);
+            var surplus = Math.max(0, spaid - sTaxAmount);
+            if (surplus > 0) {
+                perEmployeeSurplus[spid] = surplus;
+                carryoverOut += surplus;
             }
+        }
 
+        // 更新 weekRecord 的 carryover_out
+        weekRecord.carryover_out = carryoverOut;
+
+        if (carryoverOut > 0 && weekKey !== Utils.weekKey()) {
             // 计算下一周的 key
             var coRange = Utils.weekDateRange(weekKey);
             var coNextWeekDay = new Date(coRange.end.getTime() + 24 * 60 * 60 * 1000);
@@ -469,9 +497,7 @@ window.FinancePage = {
         var records = (this.employeeTaxList || []).filter(function(r) {
             return r.week_key === weekKey;
         });
-        var activeEmployees = (this.employees || []).filter(function(emp) {
-            return emp.left_date === null || emp.left_date === undefined;
-        });
+        var activeEmployees = this._getWeeklyActiveEmployees(weekKey);
 
         var needPay = 0;
         var resolved = 0;
@@ -669,8 +695,16 @@ window.FinancePage = {
                 }
             }
 
+            // 为了确保存量数据的结转 (carryover) 全部更新员工明细，收集所有的历史税务周
+            var allKnownWeeks = new Set(Object.keys(affectedWeeks));
+            for (var t = 0; t < allTxs.length; t++) {
+                if (this._isTaxTx(allTxs[t]) && allTxs[t].week_key && allTxs[t].week_key !== '__unassigned__') {
+                    allKnownWeeks.add(allTxs[t].week_key);
+                }
+            }
+
             // 对受影响周排序，初始化并级联重算
-            var sortedWeeks = Object.keys(affectedWeeks).sort();
+            var sortedWeeks = Array.from(allKnownWeeks).sort();
             for (var w = 0; w < sortedWeeks.length; w++) {
                 await this._ensureWeekExists(sortedWeeks[w]);
             }
@@ -705,7 +739,7 @@ window.FinancePage = {
         });
 
         // 也纳入有交易的但可能不在 employeeTaxList 中的活跃员工
-        var activeEmployees = this.employees || [];
+        var activeEmployees = this._getWeeklyActiveEmployees(weekKey);
         var displayedRecords = [];
 
         // 以 employeeTaxList 中的记录为基础
@@ -802,7 +836,8 @@ window.FinancePage = {
             // 状态点
             html += '<div class="emp-tax-col-dot"><span class="' + dotClass + '"></span></div>';
             // 员工名
-            html += '<div class="truncate text-gray-200">' + (row.player_name || 'Unknown') + '</div>';
+            var profileUrl = 'https://www.torn.com/profiles.php?XID=' + row.player_id;
+            html += '<div class="truncate text-gray-200"><a href="' + profileUrl + '" target="_blank" class="text-torn-accent hover:underline">' + (row.player_name || 'Unknown') + '</a></div>';
             // 应缴（可编辑）
             html += '<div class="text-right">';
             html += '<span class="emp-tax-amount-editable" data-action="edit-emp-tax" data-player-id="' + row.player_id + '" data-week-key="' + weekKey + '" title="点击编辑应缴税额">' + Utils.formatCurrency(taxAmt) + '</span>';
@@ -1695,6 +1730,12 @@ window.FinancePage = {
                 case 'cancel-writeoff':
                     await this._cancelWriteOff(btn.dataset.playerId, btn.dataset.weekKey);
                     break;
+                case 'allocate-train-fund':
+                    await this._allocateTrainFund();
+                    break;
+                case 'delete-train-fund':
+                    await this._deleteTrainFundAllocation(btn.dataset.allocationId);
+                    break;
             }
         };
         c.addEventListener('click', this._clickHandler);
@@ -1715,6 +1756,7 @@ window.FinancePage = {
         // Init sortable tables
         UI.initSortable('transactions-table');
         UI.initSortable('tax-table');
+        UI.initSortable('train-fund-table');
     },
 
     // ---- Actions ----
@@ -2855,7 +2897,8 @@ window.FinancePage = {
 
         const selectAllCb = document.getElementById('modal-ad-select-all');
         if (selectAllCb) selectAllCb.checked = true;
-    }
+    },
+
 };
 
 // Global real-time conversion for money inputs (k, m, b)

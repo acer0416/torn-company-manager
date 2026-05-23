@@ -7,8 +7,15 @@ window.TrainingPage = {
     _trainsAvailable: 0,
     _apiTrainCounts: {},
     _eventsBound: false,
+    _selectedRecordIds: new Set(),
+    _allRecords: [],
+    _nameFilterValue: '',
+    _trainFundSummary: new Map(),
+    _currentWeek: null,
 
     async init() {
+        this._currentWeek = Utils.weekKey();
+        console.log('[TrainingPage.init] _selectedRecordIds initialized:', this._selectedRecordIds instanceof Set);
         await this.render();
     },
 
@@ -49,8 +56,10 @@ window.TrainingPage = {
 
         // Load training records for current week
         const allRecords = await DB.getAll('training_records');
-        const wk = Utils.weekKey();
-        this.records = (allRecords || []).filter(r => r.week === wk);
+        const wk = this._currentWeek;
+        this._allRecords = (allRecords || []).filter(r => r.week === wk);
+        this.records = [...this._allRecords];
+        console.log('[TrainingPage._loadData] _allRecords count:', this._allRecords.length, '_selectedRecordIds:', this._selectedRecordIds ? 'Set' : 'UNDEFINED');
 
         // Load employees（使用缓存 + 统一 API）
         try {
@@ -79,39 +88,223 @@ window.TrainingPage = {
             this._trainsAvailable = '-';
         }
 
-        // 如果 _refetchTrainData 已通过 content script 设置了训练计数，跳过 API 调用
-        if (!this._skipApiTrainCounts) {
-            try {
-                this._apiTrainCounts = await TornAPI.getWeeklyEmployeeTrainCounts();
-            } catch (e) {
-                console.warn('[TrainingPage] getWeeklyEmployeeTrainCounts:', e.message);
-                this._apiTrainCounts = {};
-            }
+        // 统一使用本地 training_records 作为唯一数据源计算看板和员工列表的训练次数
+        this._apiTrainCounts = {};
+        for (const r of this.records) {
+            const pid = String(r.player_id);
+            const count = Number(r.trains_count) || 1;
+            this._apiTrainCounts[pid] = (this._apiTrainCounts[pid] || 0) + count;
         }
 
-        // 从财务 transactions 表获取本周训练类交易（用于概览收入统计）
         try {
-            const allTx = await DB.getAll('transactions');
-            const wkStart = Utils.weekDateRange(Utils.weekKey()).start.getTime();
-            this._trainTransactions = (allTx || []).filter(tx => {
-                if (tx.category !== 'train') return false;
+            const allTx = await DB.getAll('transactions') || [];
+            const allAllocations = await DB.getAll('train_fund_allocations') || [];
+            const allTrainTxs = allTx.filter(tx => tx.category === 'train');
+            
+            // For revenue overview (this week only)
+            const wkStart = Utils.weekDateRange(this._currentWeek).start.getTime();
+            this._trainTransactions = allTrainTxs.filter(tx => {
                 let ts = tx.timestamp || 0;
                 if (ts > 0 && ts < 1e12) ts *= 1000;
                 return ts >= wkStart;
             });
+
+            // Auto-Sync Train Transactions to Train Fund Allocations
+            const allocsByFinanceId = new Map();
+            allAllocations.forEach(a => {
+                if (a.financeRecordId) allocsByFinanceId.set(String(a.financeRecordId), a);
+            });
+
+            const txIds = new Set(allTrainTxs.map(tx => String(tx.id)));
+            let syncChanged = false;
+
+            // 1. Auto-Create
+            for (const tx of allTrainTxs) {
+                if (!allocsByFinanceId.has(String(tx.id))) {
+                    // Create new allocation
+                    const trainPrice = this.config.train_price || 50000;
+                    const amount = Number(tx.amount) || 0;
+                    const expectedCount = Math.floor(amount / trainPrice);
+                    
+                    if (expectedCount > 0) {
+                        const allocationId = 'fund_auto_' + tx.id;
+                        let txTs = tx.timestamp || Date.now();
+                        if (txTs < 1e12) txTs *= 1000;
+                        const txDateObj = new Date(txTs);
+                        const wk = Utils.weekKey(txDateObj);
+                        
+                        const record = {
+                            id: allocationId,
+                            employeeId: String(tx.player_id),
+                            employeeName: tx.player_name || ('ID:' + tx.player_id),
+                            amount: amount,
+                            trainPrice: trainPrice,
+                            expectedCount: expectedCount,
+                            fulfilledCount: 0,
+                            weekKey: wk,
+                            note: tx.note || '自动同步',
+                            createdAt: Date.now(),
+                            financeRecordId: String(tx.id)
+                        };
+                        
+                        await DB.put('train_fund_allocations', record);
+                        allAllocations.push(record);
+                        syncChanged = true;
+                    }
+                }
+            }
+
+            // 2. Auto-Delete
+            for (let i = allAllocations.length - 1; i >= 0; i--) {
+                const alloc = allAllocations[i];
+                if (alloc.financeRecordId && !txIds.has(String(alloc.financeRecordId))) {
+                    // Transaction was deleted, remove allocation
+                    await DB.delete('train_fund_allocations', alloc.id);
+                    allAllocations.splice(i, 1);
+                    
+                    const allTrainingRecords = await DB.getAll('training_records') || [];
+                    const fundNote = 'fund:' + alloc.id;
+                    for (const rec of allTrainingRecords) {
+                        if (rec.note === fundNote) {
+                            // Revert matched records to free
+                            rec.type = 'free';
+                            rec.amount_paid = 0;
+                            rec.note = '';
+                            await DB.put('training_records', rec);
+                        }
+                    }
+                    syncChanged = true;
+                }
+            }
+            
+            // 3. Auto-Match Unassigned API Trainings
+            let allTrainingRecords = await DB.getAll('training_records') || [];
+            
+            // Migration: Fix timestamps stored in seconds instead of ms, and their generated weeks
+            let dirtyRecords = false;
+            for (const r of allTrainingRecords) {
+                if (r.timestamp && r.timestamp < 10000000000) { // Timestamp in seconds (year < 2286)
+                    r.timestamp = r.timestamp * 1000;
+                    r.raw_date = new Date(r.timestamp).toISOString();
+                    r.week = Utils.weekKey(new Date(r.timestamp));
+                    await DB.put('training_records', r);
+                    dirtyRecords = true;
+                }
+            }
+            if (dirtyRecords) {
+                allTrainingRecords = await DB.getAll('training_records') || [];
+            }
+            
+            allTrainingRecords.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0)); // 按时间正序，优先抵扣历史欠训
+            for (const alloc of allAllocations) {
+                if (alloc.weekKey !== this._currentWeek) continue;
+                const actualFulfilled = allTrainingRecords.filter(r => r.note === 'fund:' + alloc.id).length;
+                let needed = alloc.expectedCount - actualFulfilled;
+                if (needed > 0) {
+                    const empRecords = allTrainingRecords.filter(r => 
+                        String(r.player_id) === String(alloc.employeeId) && 
+                        r.week <= alloc.weekKey && // 允许跨周匹配之前的未付款训练
+                        !(r.note && r.note.startsWith('fund:')) &&
+                        r.type !== 'paid'
+                    );
+                    
+                    for (let i = 0; i < empRecords.length && needed > 0; i++) {
+                        const rec = empRecords[i];
+                        rec.type = 'paid';
+                        rec.amount_paid = alloc.trainPrice;
+                        rec.note = 'fund:' + alloc.id;
+                        await DB.put('training_records', rec);
+                        needed--;
+                        syncChanged = true;
+                    }
+                }
+            }
+            
+            // If sync generated, deleted or matched records, reload local state
+            if (syncChanged) {
+                const updatedRecords = await DB.getAll('training_records');
+                const wk = this._currentWeek;
+                this._allRecords = (updatedRecords || []).filter(r => r.week === wk);
+                this.records = [...this._allRecords];
+            }
+
         } catch (e) {
+            console.error('[TrainingPage] Sync error:', e);
             this._trainTransactions = [];
         }
+
+        // 加载训练资金分配汇总，并更新 fulfilledCount
+        this._trainFundSummary = await this._loadTrainFundSummary();
+        
+        // 加载所有自动生成的分配，用于展示
+        const finalAllocs = await DB.getAll('train_fund_allocations') || [];
+        this._trainFundAllocations = finalAllocs.filter(a => a.weekKey === this._currentWeek);
+    },
+
+    // 从 IndexedDB 加载当前周的训练资金分配汇总
+    // 返回 Map<employeeId, { expectedCount, fulfilledCount, remaining }>
+    async _loadTrainFundSummary() {
+        const wk = this._currentWeek;
+        const summary = new Map();
+
+        try {
+            const allAllocations = await DB.getAll('train_fund_allocations');
+            const wkAllocations = (allAllocations || []).filter(a => a.weekKey === wk);
+
+            // 获取全部训练记录（跨周），因为可能抵扣了历史记录
+            const allRecords = await DB.getAll('training_records') || [];
+            const fundRecords = allRecords.filter(r => r.note && r.note.startsWith('fund:'));
+
+            for (const alloc of wkAllocations) {
+                const empId = String(alloc.employeeId);
+                const expectedCount = alloc.expectedCount || 0;
+
+                // 计算 fulfilledCount：精确匹配当前资金的分配 ID
+                const fulfilledCount = fundRecords.filter(r => r.note === 'fund:' + alloc.id).length;
+
+                // 如果 fulfilledCount 与存储值不同，更新到 DB
+                if (fulfilledCount !== (alloc.fulfilledCount || 0)) {
+                    alloc.fulfilledCount = fulfilledCount;
+                    try {
+                        await DB.put('train_fund_allocations', alloc);
+                    } catch (e) {
+                        console.warn('[TrainingPage] Failed to update fulfilledCount for', empId, e.message);
+                    }
+                }
+
+                const remaining = Math.max(0, expectedCount - fulfilledCount);
+
+                if (!summary.has(empId)) {
+                    summary.set(empId, { expectedCount: 0, fulfilledCount: 0, remaining: 0 });
+                }
+                const entry = summary.get(empId);
+                entry.expectedCount += expectedCount;
+                entry.fulfilledCount += fulfilledCount;
+                entry.remaining += remaining;
+            }
+        } catch (e) {
+            console.warn('[TrainingPage] _loadTrainFundSummary:', e.message);
+        }
+
+        return summary;
     },
 
     // ---- HTML Builders ----
 
     _headerHTML() {
+        const isCurrentWeek = this._currentWeek >= Utils.weekKey();
         return `
             <div class="flex items-center justify-between mb-6">
-                <h2 class="text-xl font-bold text-white">
-                    <i class="fas fa-dumbbell mr-2 text-torn-accent"></i>训练管理
-                </h2>
+                <div class="flex items-center gap-4">
+                    <h2 class="text-xl font-bold text-white">
+                        <i class="fas fa-dumbbell mr-2 text-torn-accent"></i>训练管理
+                    </h2>
+                    <div class="flex items-center bg-torn-surface rounded border border-torn-border px-2 py-1">
+                        <button class="btn btn-xs btn-secondary" data-action="prev-week" title="上一周"><i class="fas fa-chevron-left"></i></button>
+                        <span class="text-sm text-gray-300 px-3 font-mono">${this._currentWeek}</span>
+                        <button class="btn btn-xs btn-secondary" data-action="next-week" title="下一周" ${isCurrentWeek ? 'disabled' : ''}><i class="fas fa-chevron-right"></i></button>
+                    </div>
+                </div>
                 <div class="flex gap-2">
                     <button class="btn btn-primary" data-action="add-record">
                         <i class="fas fa-plus"></i> 添加记录
@@ -164,12 +357,20 @@ window.TrainingPage = {
         const txRevenue = (this._trainTransactions || []).reduce((s, tx) => s + (tx.amount || 0), 0);
         const totalRevenue = txRevenue > 0 ? txRevenue : recordRevenue;
 
+        // 计算待完成训练总数
+        const fundSummary = this._trainFundSummary || new Map();
+        let pendingTotal = 0;
+        for (const entry of fundSummary.values()) {
+            pendingTotal += entry.remaining;
+        }
+
         return `
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
                 ${UI.kpiCard('fas fa-dumbbell', '本周训练总次数', apiTotalTrains, '来自 Torn API', 'accent')}
                 ${UI.kpiCard('fas fa-gift', '免费赠送', freeGiven, '本地记录', 'green')}
                 ${UI.kpiCard('fas fa-coins', '付费训练', paid, '本地记录', 'gold')}
                 ${UI.kpiCard('fas fa-dollar-sign', '训练收入', Utils.formatMoney(totalRevenue), `记录: ${Utils.formatMoney(recordRevenue)} | 交易: ${Utils.formatMoney(txRevenue)}`, 'blue')}
+                ${UI.kpiCard('fas fa-clock', '待完成训练', pendingTotal, '所有员工剩余应训练次数之和', 'orange')}
             </div>
         `;
     },
@@ -203,33 +404,38 @@ window.TrainingPage = {
             { key: 'name', label: '姓名', sortable: true },
             { key: 'position', label: '职位', sortable: true },
             { key: 'trainsCount', label: '本周训练次数', sortable: true },
-            { key: 'type', label: '训练类型' },
+            { key: 'remaining', label: '剩余应训', sortable: true },
             { key: 'amountPaid', label: '已付金额', sortable: true },
             { key: 'actions', label: '操作', sortable: false }
         ];
 
         const records = this.records;
         const apiCounts = this._apiTrainCounts || {};
+        const fundSummary = this._trainFundSummary || new Map();
         const rows = this.employees.map(emp => {
             const empRecords = records.filter(r => String(r.player_id) === String(emp.player_id));
             const apiCount = apiCounts[String(emp.player_id)];
             const trainsCount = apiCount !== undefined && apiCount !== null ? apiCount : 0;
-            const types = [...new Set(empRecords.map(r => r.type))];
             const totalPaid = empRecords.reduce((s, r) => s + (r.amount_paid || 0), 0);
 
-            const typeBadges = types.length
-                ? types.map(t => {
-                    const cls = t === 'free' ? 'badge-green' : 'badge-blue';
-                    return `<span class="badge ${cls}">${t}</span>`;
-                }).join(' ')
-                : '<span class="badge badge-gray">无</span>';
+            // 计算剩余应训练次数
+            const fundEntry = fundSummary.get(String(emp.player_id));
+            let remainingHTML = '<span class="text-gray-500">-</span>';
+            if (fundEntry) {
+                const remaining = fundEntry.remaining;
+                if (remaining > 0) {
+                    remainingHTML = `<span class="font-bold text-orange-400">${remaining}</span>`;
+                } else {
+                    remainingHTML = `<span class="font-bold text-green-400">已完成</span>`;
+                }
+            }
 
             return {
                 id: emp.player_id,
                 name: `<a href="https://www.torn.com/profiles.php?XID=${emp.player_id}" target="_blank" class="text-torn-accent hover:underline">${emp.name}</a>`,
                 position: emp.position,
                 trainsCount: `<span class="font-bold text-white">${trainsCount}</span>`,
-                type: typeBadges,
+                remaining: remainingHTML,
                 amountPaid: Utils.formatMoney(totalPaid),
                 actions: `<button class="btn btn-xs btn-primary" data-action="add-for-emp" data-emp-id="${emp.player_id}"><i class="fas fa-plus"></i> 训练</button>`
             };
@@ -252,6 +458,7 @@ window.TrainingPage = {
 
     _recordsTableHTML() {
         const headers = [
+            { key: '_checkbox', label: '<input type="checkbox" id="select-all-records" />', sortable: false, width: '40px' },
             { key: 'date', label: '日期', sortable: true },
             { key: 'playerName', label: '员工', sortable: true },
             { key: 'trainsCount', label: '训练次数', sortable: true },
@@ -261,12 +468,16 @@ window.TrainingPage = {
         ];
 
         const rows = this.records.map(rec => {
+            const isChecked = (this._selectedRecordIds && this._selectedRecordIds.has(rec.id)) ? 'checked' : '';
+            const isFundRecord = rec.note && rec.note.startsWith('fund:');
+            const fundIcon = isFundRecord ? ' 💰' : '';
             const typeBadge = rec.type === 'free'
                 ? '<span class="badge badge-green">free</span>'
-                : `<span class="badge badge-blue">${rec.type}</span>`;
+                : `<span class="badge badge-blue">${rec.type}${fundIcon}</span>`;
 
             return {
                 id: rec.id,
+                _checkbox: `<input type="checkbox" class="record-checkbox" data-record-id="${rec.id}" ${isChecked} />`,
                 date: rec.date || '-',
                 playerName: rec.player_name || '-',
                 trainsCount: rec.trains_count || 0,
@@ -277,11 +488,38 @@ window.TrainingPage = {
             };
         });
 
+        const batchBar = `
+            <div class="batch-actions-bar flex items-center justify-between mb-3" id="batch-actions-bar" style="display: none;">
+                <span class="text-sm text-gray-400">
+                    已选择 <span id="selected-count" class="text-torn-accent font-bold">0</span> 条记录
+                </span>
+                <div class="flex gap-2">
+                    <button class="btn btn-xs btn-accent" data-action="batch-set-category" id="btn-batch-set-category">
+                        <i class="fas fa-folder"></i> 批量设置分类
+                    </button>
+                    <button class="btn btn-xs btn-danger" data-action="batch-delete" id="btn-batch-delete">
+                        <i class="fas fa-trash"></i> 批量删除
+                    </button>
+                </div>
+            </div>
+        `;
+
+        const nameFilterBar = `
+            <div class="flex items-center gap-2 mb-3" id="name-filter-bar">
+                <div class="relative flex-1 max-w-xs">
+                    <input type="text" class="input" id="train-name-filter" placeholder="按员工名称筛选..." value="${this._nameFilterValue || ''}" />
+                    ${this._nameFilterValue ? `<button class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white" id="clear-name-filter" style="background:none;border:none;cursor:pointer;line-height:1;">&times;</button>` : ''}
+                </div>
+            </div>
+        `;
+
         return `
             <div class="card">
                 <h3 class="text-lg font-bold text-white mb-4">
-                    <i class="fas fa-list mr-2 text-torn-accent"></i>训练记录 - 第 ${Utils.weekKey()} 周
+                    <i class="fas fa-list mr-2 text-torn-accent"></i>训练记录 - 第 ${this._currentWeek.split('W')[1] || this._currentWeek} 周
                 </h3>
+                ${nameFilterBar}
+                ${batchBar}
                 ${UI.dataTable({
                     headers,
                     rows,
@@ -292,12 +530,180 @@ window.TrainingPage = {
         `;
     },
 
+    _trainFundHTML() {
+        const allocations = this._trainFundAllocations || [];
+        if (allocations.length === 0) return '';
+        
+        const headers = [
+            { key: 'employeeName', label: '员工名称', sortable: true },
+            { key: 'amount', label: '资金总额', sortable: true },
+            { key: 'trainPrice', label: '单价', sortable: true },
+            { key: 'expectedCount', label: '预期', sortable: true },
+            { key: 'fulfilledCount', label: '已完成', sortable: true },
+            { key: 'progress', label: '进度', sortable: true },
+            { key: 'note', label: '备注', width: '200px' },
+            { key: 'actions', label: '操作', sortable: false }
+        ];
+
+        // 合并同一个员工的多条资金分配记录
+        const mergedMap = new Map();
+        allocations.forEach(a => {
+            const empId = a.employeeId;
+            if (!mergedMap.has(empId)) {
+                mergedMap.set(empId, {
+                    empId: empId,
+                    employeeName: a.employeeName,
+                    amount: 0,
+                    trainPrice: a.trainPrice, // 以第一条的单价为准
+                    expectedCount: 0,
+                    fulfilledCount: 0,
+                    notes: []
+                });
+            }
+            const m = mergedMap.get(empId);
+            m.amount += (Number(a.amount) || 0);
+            m.expectedCount += (Number(a.expectedCount) || 0);
+            m.fulfilledCount += (Number(a.fulfilledCount) || 0);
+            if (a.note) m.notes.push(a.note);
+        });
+
+        const mergedAllocations = Array.from(mergedMap.values());
+
+        const rows = mergedAllocations.map(a => {
+            const expected = a.expectedCount || 0;
+            const fulfilled = a.fulfilledCount || 0;
+            const pct = expected > 0 ? Math.round(fulfilled / expected * 100) : 0;
+            const progressBar = '<div class="w-full bg-gray-700 rounded-full h-2.5">' +
+                '<div class="bg-torn-accent h-2.5 rounded-full" style="width:' + pct + '%"></div>' +
+                '</div>' +
+                '<span class="text-xs text-gray-400">' + fulfilled + '/' + expected + ' (' + pct + '%)</span>';
+            
+            const combinedNote = a.notes.join(' | ');
+
+            return {
+                employeeName: a.employeeName || '-',
+                amount: Utils.formatCurrency(a.amount || 0),
+                trainPrice: Utils.formatCurrency(a.trainPrice || 0),
+                expectedCount: expected,
+                fulfilledCount: fulfilled,
+                progress: progressBar,
+                note: combinedNote ? '<span class="truncate block max-w-[200px]" title="' + combinedNote.replace(/"/g, '&quot;') + '">' + combinedNote + '</span>' : '-',
+                actions: `<button class="btn btn-xs btn-primary" data-action="view-fund-details" data-emp-id="${a.empId}">查看明细</button>`
+            };
+        });
+
+        return `
+            <div class="card mb-6">
+                <h3 class="text-lg font-bold text-white mb-2">
+                    <i class="fas fa-hand-holding-usd mr-2 text-torn-accent"></i>训练资金自动同步状态
+                </h3>
+                <p class="text-xs text-gray-400 mb-4">自动同步自财务管理的“训练”类交易。如需修改或删除，请前往财务管理操作。</p>
+                ${UI.dataTable({
+                    headers,
+                    rows,
+                    id: 'train-fund-table',
+                    emptyText: '本周暂无训练资金交易'
+                })}
+            </div>
+        `;
+    },
+
+    async _showFundDetailsModal(empId) {
+        const emp = this.employees.find(e => String(e.player_id) === String(empId));
+        if (!emp) return;
+
+        const allAllocations = await DB.getAll('train_fund_allocations') || [];
+        const wkAllocations = allAllocations.filter(a => a.weekKey === this._currentWeek && String(a.employeeId) === String(empId));
+        
+        if (wkAllocations.length === 0) {
+            Utils.toast('未找到本周的资金分配记录', 'info');
+            return;
+        }
+
+        const allocIds = wkAllocations.map(a => a.id);
+        const allRecords = await DB.getAll('training_records') || [];
+        
+        // 筛选出被抵扣到这些资金分配上的记录
+        const matchedRecords = allRecords.filter(r => r.note && allocIds.some(id => r.note === 'fund:' + id));
+
+        const html = `
+            <div class="p-6 w-[800px] max-w-[90vw]">
+                <h3 class="text-lg font-bold text-white mb-2">资金抵扣明细 - ${emp.name}</h3>
+                <div class="text-gray-400 text-sm mb-4">展示本周该员工名下资金所匹配的所有训练记录</div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-torn-surface text-gray-400 text-sm border-b border-torn-border">
+                                <th class="p-2">训练时间</th>
+                                <th class="p-2">归属周</th>
+                                <th class="p-2">分类</th>
+                                <th class="p-2">抵扣金额</th>
+                                <th class="p-2 text-right">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${matchedRecords.length === 0 ? `
+                                <tr><td colspan="5" class="p-4 text-center text-gray-500 text-sm">暂无匹配记录</td></tr>
+                            ` : matchedRecords.map(r => `
+                                <tr class="border-b border-torn-border/50 hover:bg-torn-surface/50 text-sm">
+                                    <td class="p-2 text-white">${Utils.formatDateTime(r.timestamp) || r.raw_date}</td>
+                                    <td class="p-2 text-gray-300">${r.week}</td>
+                                    <td class="p-2 text-gray-300">${(window.TRAIN_CATEGORIES.find(c => c.id === (r.category || 'other')) || {name: r.category || 'other'}).name}</td>
+                                    <td class="p-2 text-torn-green font-bold">${Utils.formatMoney(r.amount_paid || 0)}</td>
+                                    <td class="p-2 text-right">
+                                        <button class="btn btn-xs btn-secondary" data-action="unmatch-fund-record" data-record-id="${r.id}">解除抵扣</button>
+                                    </td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+                <div class="flex justify-end mt-6">
+                    <button class="btn btn-secondary" id="modal-fund-close">关闭</button>
+                </div>
+            </div>
+        `;
+
+        Utils.showModal(html);
+
+        document.getElementById('modal-fund-close')?.addEventListener('click', () => Utils.hideModal());
+
+        // unbind previous delegated events on modal content if any
+        const modalContent = document.getElementById('modal-content');
+        if (modalContent) {
+            const unmatchHandler = async (e) => {
+                const btn = e.target.closest('[data-action="unmatch-fund-record"]');
+                if (!btn) return;
+                
+                if (!confirm('确定要解除这条记录的抵扣状态吗？\n它将被恢复为“免费训练”。')) return;
+
+                const idStr = String(btn.dataset.recordId);
+                const id = isNaN(Number(idStr)) ? idStr : Number(idStr);
+
+                const rec = await DB.get('training_records', id);
+                if (rec) {
+                    rec.type = 'free';
+                    rec.amount_paid = 0;
+                    rec.note = 'api_sync'; // Restore to default api sync note
+                    await DB.put('training_records', rec);
+                    Utils.toast('已解除抵扣', 'success');
+                    Utils.hideModal();
+                    await this.render();
+                }
+            };
+            
+            // simple hack to bind event uniquely
+            modalContent.onclick = unmatchHandler;
+        }
+    },
+
     _buildHTML() {
         return `
             ${this._headerHTML()}
             ${this._configHTML()}
             ${this._kpiHTML()}
             ${this._calculatorHTML()}
+            ${this._trainFundHTML()}
             ${this._employeeTableHTML()}
             ${this._recordsTableHTML()}
         `;
@@ -313,6 +719,8 @@ window.TrainingPage = {
         if (!this._eventsBound) {
             this._eventsBound = true;
             c.addEventListener('click', async (e) => {
+                if (Router.currentPage !== 'training') return;
+
                 const btn = e.target.closest('[data-action]');
                 if (!btn) return;
 
@@ -320,6 +728,12 @@ window.TrainingPage = {
                 switch (action) {
                     case 'refresh':
                         await this.render();
+                        break;
+                    case 'prev-week':
+                        await this._goToPrevWeek();
+                        break;
+                    case 'next-week':
+                        await this._goToNextWeek();
                         break;
                     case 'refetch-train-data':
                         await this._refetchTrainData();
@@ -342,9 +756,78 @@ window.TrainingPage = {
                     case 'delete-record':
                         await this._deleteRecord(btn.dataset.recordId);
                         break;
+                    case 'batch-delete':
+                        await this._batchDeleteRecords();
+                        break;
+                    case 'batch-set-category':
+                        await this._batchSetCategory();
+                        break;
+                    case 'view-fund-details':
+                        await this._showFundDetailsModal(btn.dataset.empId);
+                        break;
+                }
+            });
+
+            c.addEventListener('input', (e) => {
+                if (Router.currentPage !== 'training') return;
+                if (e.target.id === 'train-name-filter') {
+                    this._filterRecordsByNameDebounced();
+                }
+            });
+
+            c.addEventListener('click', (e) => {
+                if (Router.currentPage !== 'training') return;
+                if (e.target.id === 'clear-name-filter') {
+                    const filterInput = document.getElementById('train-name-filter');
+                    if (filterInput) {
+                        filterInput.value = '';
+                        this._nameFilterValue = '';
+                        this._filterRecordsByName();
+                    }
                 }
             });
         }
+
+        // 全选/取消全选 checkbox
+        const selectAll = document.getElementById('select-all-records');
+        if (selectAll) {
+            selectAll.addEventListener('change', () => {
+                const checkboxes = document.querySelectorAll('.record-checkbox');
+                checkboxes.forEach(cb => {
+                    cb.checked = selectAll.checked;
+                    const idStr = cb.dataset.recordId;
+                    const id = isNaN(Number(idStr)) ? idStr : Number(idStr);
+                    if (selectAll.checked) {
+                        this._selectedRecordIds.add(id);
+                    } else {
+                        this._selectedRecordIds.delete(id);
+                    }
+                });
+                this._updateBatchBar();
+            });
+        }
+
+        // 单个 checkbox 变化
+        document.querySelectorAll('.record-checkbox').forEach(cb => {
+            cb.addEventListener('change', () => {
+                const idStr = cb.dataset.recordId;
+                const id = isNaN(Number(idStr)) ? idStr : Number(idStr);
+                if (cb.checked) {
+                    this._selectedRecordIds.add(id);
+                } else {
+                    this._selectedRecordIds.delete(id);
+                }
+                const allCb = document.getElementById('select-all-records');
+                if (allCb) {
+                    const total = document.querySelectorAll('.record-checkbox').length;
+                    allCb.checked = this._selectedRecordIds.size === total && total > 0;
+                    allCb.indeterminate = this._selectedRecordIds.size > 0 && this._selectedRecordIds.size < total;
+                }
+                this._updateBatchBar();
+            });
+        });
+
+        this._updateBatchBar();
 
         // Init sortable tables
         UI.initSortable('train-emp-table');
@@ -352,6 +835,19 @@ window.TrainingPage = {
     },
 
     // ---- Actions ----
+
+    async _goToPrevWeek() {
+        this._currentWeek = Utils.weekKeyAdd(this._currentWeek, -1);
+        if (this._selectedRecordIds) this._selectedRecordIds.clear();
+        await this.render();
+    },
+
+    async _goToNextWeek() {
+        if (this._currentWeek >= Utils.weekKey()) return;
+        this._currentWeek = Utils.weekKeyAdd(this._currentWeek, 1);
+        if (this._selectedRecordIds) this._selectedRecordIds.clear();
+        await this.render();
+    },
 
     async _saveConfig() {
         const freeTrains = parseInt(document.getElementById('cfg-free-trains')?.value) || 0;
@@ -393,81 +889,107 @@ window.TrainingPage = {
     async _deleteRecord(recordId) {
         if (!confirm('确定删除此训练记录？')) return;
         // training_records store uses autoIncrement (numeric key), but dataset values are strings
-        await DB.delete('training_records', Number(recordId));
+        const idStr = String(recordId);
+        const id = isNaN(Number(idStr)) ? idStr : Number(idStr);
+        await DB.delete('training_records', id);
         Utils.toast('记录已删除', 'info');
         await this.render();
     },
 
-    async _refetchTrainData() {
-      Utils.showLoading('正在从 Torn 公司页面抓取完整训练数据...');
-      try {
-        // 通过 background service worker 触发 content script 抓取
-        const result = await chrome.runtime.sendMessage({ action: 'scrapeTraining' });
-
-        if (!result || !result.ok) {
-          throw new Error(result?.error || '抓取失败');
-        }
-
-        // 抓取成功后，从 IndexedDB 读取最新快照并更新 API 计数
-        const snapshotResult = await chrome.runtime.sendMessage({ action: 'getTrainingSnapshot' });
-
-        if (snapshotResult && snapshotResult.ok && snapshotResult.snapshot) {
-          const snapshot = snapshotResult.snapshot;
-
-          // 将抓取的条目转换为 API 计数格式 { player_id: count }
-          const counts = {};
-          const entries = snapshot.entries || [];
-          for (const entry of entries) {
-            const emp = this._matchEmployee(entry);
-            if (emp) {
-              counts[emp.player_id] = (counts[emp.player_id] || 0) + 1;
+    async _mergeApiEntriesToRecords(entries) {
+        if (!entries || entries.length === 0) return;
+        const allRecords = await DB.getAll('training_records') || [];
+        
+        let newCount = 0;
+        let updateCount = 0;
+        
+        for (const entry of entries) {
+            // entry = { playerId, playerName, timestamp, details: { title, category, stat_before, stat_after, stat_gain }, logId, newsId }
+            let existing = null;
+            if (entry.logId) {
+                existing = allRecords.find(r => r.note === `log:${entry.logId}`);
             }
-          }
-          this._apiTrainCounts = counts;
-          console.log('[TrainingPage] Scraped training data:', entries.length, 'entries, matched', Object.keys(counts).length, 'employees');
-        }
-
-        // 重新获取公司详情（更新可用训练次数）
-        try {
-          const detail = await TornAPI.getCompanyDetailed();
-          this._trainsAvailable = detail?.company_detailed?.trains_available
-            ?? detail?.trains_available
-            ?? detail?.company?.trains_available
-            ?? 0;
-        } catch (e) {
-          console.warn('[TrainingPage] refetch detailed:', e.message);
-        }
-
-        Utils.hideLoading();
-        Utils.toast(`训练数据已从 Torn 页面抓取 (${result.count || 0} 条记录)`, 'success');
-        // 使用 _skipApiTrainCounts 标志防止 render → _loadData 覆盖 scraper 数据
-        this._skipApiTrainCounts = true;
-        await this.render();
-        this._skipApiTrainCounts = false;
-        } catch (e) {
-            Utils.hideLoading();
-            // 如果 content script 抓取失败，回退到 API 方式
-            console.warn('[TrainingPage] Content script scrape failed, falling back to API:', e.message);
-            Utils.showLoading('Content script 抓取失败，回退到 Torn API...');
-            try {
-                this._apiTrainCounts = await TornAPI.getWeeklyEmployeeTrainCounts();
-                try {
-                    const detail = await TornAPI.getCompanyDetailed();
-                    this._trainsAvailable = detail?.company_detailed?.trains_available
-                        ?? detail?.trains_available
-                        ?? detail?.company?.trains_available
-                        ?? 0;
-                } catch (e2) {
-                    console.warn('[TrainingPage] refetch detailed:', e2.message);
+            if (!existing && entry.newsId) {
+                existing = allRecords.find(r => r.note === `news:${entry.newsId}`);
+            }
+            
+            if (existing) {
+                // Update missing details if needed
+                let changed = false;
+                if (!existing.timestamp && entry.timestamp) {
+                    existing.timestamp = entry.timestamp * 1000;
+                    changed = true;
                 }
-                Utils.hideLoading();
-                Utils.toast('已通过 Torn API 拉取训练数据（可能不完整，仅 ~25 条）', 'warning');
-                await this.render();
-            } catch (e2) {
-                Utils.hideLoading();
-                Utils.toast(`拉取训练数据失败: ${e2.message}`, 'error');
-                console.error('[TrainingPage] _refetchTrainData fallback:', e2);
+                
+                // 自动修复现有记录中错误的员工名称（如 "Company train send"）
+                const empObj = this._matchEmployee(entry);
+                if (empObj && existing.player_name !== empObj.name) {
+                    existing.player_name = empObj.name;
+                    existing.player_id = empObj.player_id;
+                    changed = true;
+                }
+
+                if (changed) {
+                    await DB.put('training_records', existing);
+                    updateCount++;
+                }
+            } else {
+                // Determine week key from timestamp
+                const wk = Utils.weekKey(new Date(entry.timestamp * 1000));
+                const empObj = this._matchEmployee(entry);
+                const record = {
+                    id: Date.now() + Math.random().toString(36).substr(2, 9),
+                    week: wk,
+                    player_id: empObj ? empObj.player_id : entry.playerId,
+                    player_name: empObj ? empObj.name : entry.playerName,
+                    type: 'free', // 默认免费，loadData 的匹配逻辑会自动改为 paid
+                    trains_count: 1, // 每次 API 同步产生一条记录，对应 1 次训练
+                    amount_paid: 0,
+                    category: entry.details?.category || 'other',
+                    raw_text: entry.details?.title || entry.rawText,
+                    raw_date: new Date(entry.timestamp * 1000).toISOString(),
+                    timestamp: entry.timestamp * 1000,
+                    note: entry.logId ? `log:${entry.logId}` : (entry.newsId ? `news:${entry.newsId}` : 'api_sync'),
+                    created_at: Date.now()
+                };
+                await DB.put('training_records', record);
+                allRecords.push(record);
+                newCount++;
             }
+        }
+        
+        console.log(`[TrainingPage] Synced API entries: ${newCount} new, ${updateCount} updated.`);
+    },
+
+    async _refetchTrainData() {
+        Utils.showLoading('正在从 Torn API (v2 /user/log) 拉取训练数据...');
+        try {
+            const activeEmployees = this.employees.filter(e => !e.left_date);
+            const empIds = activeEmployees.map(e => e.player_id);
+            const range = Utils.weekDateRange(this._currentWeek);
+            const entries = await TornAPI.getTrainingFromAllEmployees(empIds, range.start.getTime(), range.end.getTime());
+
+            await this._mergeApiEntriesToRecords(entries);
+
+            // 更新可用训练次数
+            try {
+                const detail = await TornAPI.getCompanyDetailed();
+                this._trainsAvailable = detail?.company_detailed?.trains_available
+                    ?? detail?.trains_available
+                    ?? detail?.company?.trains_available
+                    ?? 0;
+            } catch (e2) {
+                console.warn('[TrainingPage] refetch detailed:', e2.message);
+            }
+
+            Utils.hideLoading();
+            Utils.toast('已成功拉取最新训练数据', 'success');
+            
+            await this.render();
+        } catch(e) {
+            Utils.hideLoading();
+            Utils.toast(`拉取失败: ${e.message}`, 'error');
+            console.error('[TrainingPage] _refetchTrainData failed:', e);
         }
     },
 
@@ -692,6 +1214,220 @@ window.TrainingPage = {
             Utils.toast('训练记录已保存', 'success');
             Utils.hideModal();
             await this.render();
+        });
+    },
+
+    // ---- 名称筛选 ----
+
+    _applyNameFilter(records) {
+        const filterValue = (this._nameFilterValue || '').trim().toLowerCase();
+        if (!filterValue) return records;
+        return records.filter(r => {
+            const name = (r.player_name || '').toLowerCase();
+            return name.includes(filterValue);
+        });
+    },
+
+    _filterRecordsByName() {
+        const filterInput = document.getElementById('train-name-filter');
+        this._nameFilterValue = filterInput ? filterInput.value : '';
+        this.records = this._applyNameFilter(this._allRecords);
+        const card = document.querySelector('#page-content .card:last-of-type');
+        if (card) {
+            card.outerHTML = this._recordsTableHTML();
+            this._rebindCheckboxes();
+            UI.initSortable('train-records-table');
+        }
+    },
+
+    _filterRecordsByNameDebounced() {
+        if (this._nameFilterDebounce) {
+            clearTimeout(this._nameFilterDebounce);
+        }
+        this._nameFilterDebounce = setTimeout(() => {
+            this._filterRecordsByName();
+        }, 300);
+    },
+
+    _rebindCheckboxes() {
+        const selectAll = document.getElementById('select-all-records');
+        if (selectAll) {
+            selectAll.addEventListener('change', () => {
+                const checkboxes = document.querySelectorAll('.record-checkbox');
+                checkboxes.forEach(cb => {
+                    cb.checked = selectAll.checked;
+                    const idStr = cb.dataset.recordId;
+                    const id = isNaN(Number(idStr)) ? idStr : Number(idStr);
+                    if (selectAll.checked) {
+                        this._selectedRecordIds.add(id);
+                    } else {
+                        this._selectedRecordIds.delete(id);
+                    }
+                });
+                this._updateBatchBar();
+            });
+        }
+
+        document.querySelectorAll('.record-checkbox').forEach(cb => {
+            cb.addEventListener('change', () => {
+                const idStr = cb.dataset.recordId;
+                const id = isNaN(Number(idStr)) ? idStr : Number(idStr);
+                if (cb.checked) {
+                    this._selectedRecordIds.add(id);
+                } else {
+                    this._selectedRecordIds.delete(id);
+                }
+                const allCb = document.getElementById('select-all-records');
+                if (allCb) {
+                    const total = document.querySelectorAll('.record-checkbox').length;
+                    allCb.checked = this._selectedRecordIds.size === total && total > 0;
+                    allCb.indeterminate = this._selectedRecordIds.size > 0 && this._selectedRecordIds.size < total;
+                }
+                this._updateBatchBar();
+            });
+        });
+
+        this._updateBatchBar();
+    },
+
+    // ---- 批量管理 ----
+
+    _updateBatchBar() {
+        const bar = document.getElementById('batch-actions-bar');
+        const countEl = document.getElementById('selected-count');
+        if (!bar || !countEl) return;
+
+        const count = this._selectedRecordIds ? this._selectedRecordIds.size : 0;
+        if (count > 0) {
+            bar.style.display = 'flex';
+            countEl.textContent = count;
+        } else {
+            bar.style.display = 'none';
+        }
+    },
+
+    async _batchDeleteRecords() {
+        if (!this._selectedRecordIds || this._selectedRecordIds.size === 0) return;
+        const count = this._selectedRecordIds.size;
+
+        const html = `
+            <div class="p-6">
+                <h3 class="text-lg font-bold text-white mb-4">
+                    <i class="fas fa-exclamation-triangle text-red-400 mr-2"></i>确认批量删除
+                </h3>
+                <p class="text-gray-300 mb-2">确定要删除选中的 <span class="text-torn-accent font-bold">${count}</span> 条训练记录吗？</p>
+                <p class="text-red-400 text-sm mb-6">此操作不可撤销！</p>
+                <div class="flex justify-end gap-2">
+                    <button class="btn btn-secondary" id="batch-delete-cancel">取消</button>
+                    <button class="btn btn-danger" id="batch-delete-confirm">确认删除</button>
+                </div>
+            </div>
+        `;
+        Utils.showModal(html);
+
+        document.getElementById('batch-delete-cancel')?.addEventListener('click', () => {
+            Utils.hideModal();
+        });
+
+        document.getElementById('batch-delete-confirm')?.addEventListener('click', async () => {
+            Utils.hideModal();
+            Utils.showLoading('正在批量删除...');
+            try {
+                let deleted = 0;
+                for (const id of this._selectedRecordIds) {
+                    try {
+                        await DB.delete('training_records', id);
+                        deleted++;
+                    } catch (e) {
+                        console.warn(`[TrainingPage] Failed to delete record ${id}:`, e.message);
+                    }
+                }
+                this._selectedRecordIds = new Set();
+                Utils.hideLoading();
+                Utils.toast(`已删除 ${deleted} 条记录`, deleted === count ? 'success' : 'warning');
+                await this.render();
+            } catch (e) {
+                Utils.hideLoading();
+                Utils.toast(`批量删除失败: ${e.message}`, 'error');
+            }
+        });
+    },
+
+    async _batchSetCategory() {
+        if (!this._selectedRecordIds || this._selectedRecordIds.size === 0) {
+            Utils.toast('请先选择要设置分类的记录', 'warning');
+            return;
+        }
+        const count = this._selectedRecordIds.size;
+
+        const categories = window.TRAIN_CATEGORIES || [];
+        const categoryOptions = categories.map(cat =>
+            `<option value="${cat.value}">${cat.label}</option>`
+        ).join('');
+
+        const html = `
+            <div class="p-6">
+                <h3 class="text-lg font-bold text-white mb-4">
+                    <i class="fas fa-folder mr-2 text-torn-accent"></i>批量设置训练分类
+                </h3>
+                <p class="text-gray-300 mb-4">将为选中的 <span class="text-torn-accent font-bold">${count}</span> 条记录设置分类：</p>
+                <div class="mb-4">
+                    <label class="text-gray-400 text-sm mb-1 block">训练分类</label>
+                    <select class="input" id="batch-category-select">
+                        ${categoryOptions}
+                    </select>
+                </div>
+                <div class="flex justify-end gap-2 mt-6">
+                    <button class="btn btn-secondary" id="batch-category-cancel">取消</button>
+                    <button class="btn btn-primary" id="batch-category-confirm">确认设置</button>
+                </div>
+            </div>
+        `;
+        Utils.showModal(html);
+
+        document.getElementById('batch-category-cancel')?.addEventListener('click', () => {
+            Utils.hideModal();
+        });
+
+        document.getElementById('batch-category-confirm')?.addEventListener('click', async () => {
+            const category = document.getElementById('batch-category-select')?.value;
+            if (!category) {
+                Utils.toast('请选择训练分类', 'warning');
+                return;
+            }
+
+            Utils.hideModal();
+            Utils.showLoading('正在批量设置分类...');
+            try {
+                let updated = 0;
+                let failed = 0;
+                for (const id of this._selectedRecordIds) {
+                    try {
+                        const record = await DB.get('training_records', id);
+                        if (record) {
+                            record.type = category;
+                            await DB.put('training_records', record);
+                            updated++;
+                        } else {
+                            failed++;
+                            console.warn(`[TrainingPage] Record not found for batch category update: ${id}`);
+                        }
+                    } catch (e) {
+                        failed++;
+                        console.warn(`[TrainingPage] Failed to update category for record ${id}:`, e.message);
+                    }
+                }
+                this._selectedRecordIds = new Set();
+                Utils.hideLoading();
+                const msg = failed > 0
+                    ? `已更新 ${updated} 条记录的分类，${failed} 条失败`
+                    : `已更新 ${updated} 条记录的分类`;
+                Utils.toast(msg, updated > 0 ? 'success' : 'warning');
+                await this.render();
+            } catch (e) {
+                Utils.hideLoading();
+                Utils.toast(`批量设置分类失败: ${e.message}`, 'error');
+            }
         });
     }
 };
