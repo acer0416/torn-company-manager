@@ -34,7 +34,6 @@
       <a href="#/rehab" class="nav-item" data-page="rehab"><i class="fas fa-syringe w-4 text-center"></i><span>毒瘾监控</span></a>
       <a href="#/boost" class="nav-item" data-page="boost"><i class="fas fa-rocket w-4 text-center"></i><span>Boost管理</span></a>
       <div class="border-t border-torn-border my-2 mx-3"></div>
-      <a href="#/data" class="nav-item" data-page="data"><i class="fas fa-database w-4 text-center"></i><span>数据管理</span></a>
       <a href="#/settings" class="nav-item" data-page="settings"><i class="fas fa-cog w-4 text-center"></i><span>设置</span></a>
     </nav>
     <main class="flex-1 overflow-y-auto p-4" id="main-content">
@@ -71,6 +70,7 @@
         sendMessage: () => {},
       },
       windows: { create: () => {} },
+      tabs: { create: () => {} },
       alarms: { clearAll: () => {}, create: () => {} },
     };
     // Set test API key
@@ -86,11 +86,11 @@
   <script src="js/pages/dashboard.js"></script>
   <script src="js/pages/employees.js"></script>
   <script src="js/pages/training.js"></script>
+  <script src="js/pages/training-planner.js"></script>
   <script src="js/pages/stock.js"></script>
   <script src="js/pages/finance.js"></script>
   <script src="js/pages/rehab.js"></script>
   <script src="js/pages/boost.js"></script>
-  <script src="js/pages/data.js"></script>
   <script src="js/pages/settings.js"></script>
   <script src="js/router.js"></script>
   <script src="js/app.js"></script>

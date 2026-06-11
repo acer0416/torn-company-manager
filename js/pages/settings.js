@@ -54,7 +54,8 @@ window.SettingsPage = {
                 SETTINGS_KEYS.MONITORING_ENABLED,
                 SETTINGS_KEYS.CHECK_INTERVAL,
                 SETTINGS_KEYS.REFRESH_INTERVAL,
-                SETTINGS_KEYS.NOTIFICATIONS_ENABLED
+                SETTINGS_KEYS.NOTIFICATIONS_ENABLED,
+                'dash_addiction_threshold'
             ]);
             // 仅当 DB 中不存在该 key 时才从 chrome.storage.local 回退
             if (result[SETTINGS_KEYS.API_KEY] && this.settings[SETTINGS_KEYS.API_KEY] === undefined)
@@ -67,6 +68,8 @@ window.SettingsPage = {
                 this.settings[SETTINGS_KEYS.REFRESH_INTERVAL] = result[SETTINGS_KEYS.REFRESH_INTERVAL];
             if (result[SETTINGS_KEYS.NOTIFICATIONS_ENABLED] !== undefined && this.settings[SETTINGS_KEYS.NOTIFICATIONS_ENABLED] === undefined)
                 this.settings[SETTINGS_KEYS.NOTIFICATIONS_ENABLED] = result[SETTINGS_KEYS.NOTIFICATIONS_ENABLED];
+            if (result['dash_addiction_threshold'] !== undefined && this.settings['dash_addiction_threshold'] === undefined)
+                this.settings['dash_addiction_threshold'] = result['dash_addiction_threshold'];
         } catch (e) {
             // chrome.storage.local may not be available
         }
@@ -114,6 +117,7 @@ window.SettingsPage = {
         const notifications = this.settings[SETTINGS_KEYS.NOTIFICATIONS_ENABLED] ?? true;
         const checkInterval = this.settings[SETTINGS_KEYS.CHECK_INTERVAL] || 5;
         const refreshInterval = this.settings[SETTINGS_KEYS.REFRESH_INTERVAL] || 15;
+        const addictionThreshold = this.settings['dash_addiction_threshold'] ?? 5;
 
         return `
             <div class="flex items-center justify-between mb-6">
@@ -182,19 +186,47 @@ window.SettingsPage = {
                         <div class="text-gray-500 text-xs mb-2">自动刷新仪表盘数据 (分钟)</div>
                         <input id="settings-refresh-interval" class="input input-sm" type="number" min="1" value="${refreshInterval}">
                     </div>
+                    <div class="bg-torn-surface rounded-lg p-3">
+                        <div class="text-white text-sm font-medium mb-1">毒瘾提醒阈值</div>
+                        <div class="text-gray-500 text-xs mb-2">当工作效能削弱达到此值时发出警告 (1-100)</div>
+                        <input id="settings-addiction-threshold" class="input input-sm" type="number" min="1" max="100" value="${addictionThreshold}">
+                    </div>
                 </div>
             </div>
 
 
-            <!-- Window -->
+
+            <!-- Data Operations -->
             <div class="card mb-6">
                 <h3 class="text-lg font-bold text-white mb-4">
-                    <i class="fas fa-window-restore mr-2 text-torn-purple"></i>窗口
+                    <i class="fas fa-database mr-2 text-torn-blue"></i>数据操作
                 </h3>
-                <div class="text-gray-400 text-sm mb-3">在独立窗口中打开管理器，获得更好的使用体验。</div>
-                <button id="settings-open-window" class="btn btn-primary">
-                    <i class="fas fa-external-link-alt mr-2"></i>在新窗口中打开
-                </button>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <!-- Export -->
+                    <div class="bg-torn-surface rounded-lg p-4 border border-torn-border">
+                        <div class="text-torn-green font-bold mb-2">
+                            <i class="fas fa-download mr-2"></i>导出数据
+                        </div>
+                        <div class="text-gray-400 text-sm mb-3">下载完整JSON备份文件</div>
+                        <button id="data-export" class="btn btn-success w-full">导出备份</button>
+                    </div>
+                    <!-- Import -->
+                    <div class="bg-torn-surface rounded-lg p-4 border border-torn-border">
+                        <div class="text-torn-blue font-bold mb-2">
+                            <i class="fas fa-upload mr-2"></i>导入数据
+                        </div>
+                        <div class="text-gray-400 text-sm mb-3">从JSON备份文件恢复数据</div>
+                        <button id="data-import" class="btn btn-primary w-full">导入备份</button>
+                    </div>
+                    <!-- Clear -->
+                    <div class="bg-torn-surface rounded-lg p-4 border border-torn-border">
+                        <div class="text-red-400 font-bold mb-2">
+                            <i class="fas fa-trash-alt mr-2"></i>清空数据
+                        </div>
+                        <div class="text-gray-400 text-sm mb-3">永久删除所有存储数据，不可撤销</div>
+                        <button id="data-clear" class="btn w-full bg-red-600 hover:bg-red-700 text-white">清空所有数据</button>
+                    </div>
+                </div>
             </div>
 
             <!-- About -->
@@ -299,19 +331,19 @@ window.SettingsPage = {
             Utils.toast('刷新间隔已更新', 'info');
         });
 
-        // Open in new window
-        document.getElementById('settings-open-window')?.addEventListener('click', () => {
-            try {
-                chrome.windows.create({
-                    url: chrome.runtime.getURL('popup/index.html'),
-                    type: 'popup',
-                    width: 1280,
-                    height: 900
-                });
-            } catch (e) {
-                Utils.toast('无法在此上下文中打开新窗口', 'error');
-            }
+        // Addiction threshold
+        document.getElementById('settings-addiction-threshold')?.addEventListener('change', async (e) => {
+            const val = Math.max(1, Math.min(100, Math.abs(parseInt(e.target.value)) || 5));
+            await this.saveSetting('dash_addiction_threshold', val);
+            Utils.toast('毒瘾提醒阈值已更新', 'info');
         });
+
+
+
+        // Data operations
+        document.getElementById('data-export')?.addEventListener('click', () => this.exportData());
+        document.getElementById('data-import')?.addEventListener('click', () => this.importData());
+        document.getElementById('data-clear')?.addEventListener('click', () => this.clearAllData());
     },
 
     async _loadCompanyInfo() {
@@ -320,34 +352,210 @@ window.SettingsPage = {
         if (!card || !infoDiv) return;
 
         try {
-            const data = await TornAPI.getCompanyProfile();
-            const company = data?.company || {};
-            if (!company.name) return;
+            const data = await TornAPI.getCompanyData();
+            const profile = data?.profile || {};
+            if (!profile.name) return;
 
             card.style.display = '';
-            const rating = company.rating || 0;
-            const stars = '★'.repeat(rating) + '☆'.repeat(Math.max(0, 5 - rating));
+            const rating = profile.rating || 0;
+            const starHtml = UI.starPattern(rating);
+            const companyTypeName = await Utils.resolveCompanyTypeName(profile);
+            const employeesCount = data.employees?.length || 0;
+            const capacity = profile.employees_capacity || data.detailed?.company_size || 10;
 
             infoDiv.innerHTML = `
                 <div class="bg-torn-surface rounded-lg p-3">
                     <div class="text-gray-400 text-xs mb-1">公司名称</div>
-                    <div class="text-white font-bold">${company.name || 'N/A'}</div>
+                    <div class="text-white font-bold">${profile.name || 'N/A'}</div>
                 </div>
                 <div class="bg-torn-surface rounded-lg p-3">
                     <div class="text-gray-400 text-xs mb-1">公司类型</div>
-                    <div class="text-white font-bold">${company.type || 'N/A'}</div>
+                    <div class="text-white font-bold">${companyTypeName}</div>
                 </div>
-                <div class="bg-torn-surface rounded-lg p-3">
+                <div class="bg-torn-surface rounded-lg p-3 flex flex-col justify-between">
                     <div class="text-gray-400 text-xs mb-1">评分</div>
-                    <div class="text-torn-gold font-bold">${stars}</div>
+                    <div>${starHtml}</div>
                 </div>
                 <div class="bg-torn-surface rounded-lg p-3">
                     <div class="text-gray-400 text-xs mb-1">员工</div>
-                    <div class="text-white font-bold">${Object.keys(data.employees || {}).length || 0}/${company.capacity || 10}</div>
+                    <div class="text-white font-bold">${employeesCount}/${capacity}</div>
                 </div>
             `;
         } catch (e) {
             // Silently fail if API key invalid
         }
+    },
+
+    async importData() {
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.accept = '.json';
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = async (ev) => {
+                try {
+                    const data = JSON.parse(ev.target.result);
+                    await this._showImportPreview(data);
+                } catch (err) {
+                    Utils.toast('无效的JSON文件', 'error');
+                }
+            };
+            reader.readAsText(file);
+        });
+        fileInput.click();
+    },
+
+    async _showImportPreview(data) {
+        Utils.showLoading('正在分析备份数据...');
+        const counts = {};
+        for (const store of ALL_STORES) {
+            try {
+                counts[store] = await DB.count(store);
+            } catch (e) {
+                counts[store] = 0;
+            }
+        }
+        Utils.hideLoading();
+
+        const content = document.createElement('div');
+        content.className = 'p-6';
+
+        let totalImport = 0;
+        let hasOverwrite = false;
+
+        const storeRows = ALL_STORES.map(store => {
+            const importCount = data[store]?.length || 0;
+            const currentCount = counts[store] || 0;
+            totalImport += importCount;
+            if (currentCount > 0 && importCount > 0) hasOverwrite = true;
+            const countClass = importCount > 0 ? 'text-torn-green font-bold' : 'text-gray-500';
+            return `
+                <div class="flex justify-between items-center py-1 px-2 rounded bg-torn-surface">
+                    <span class="text-gray-300 text-sm">${store}</span>
+                    <div class="flex items-center gap-3">
+                        <span class="text-gray-500 text-xs">当前: ${currentCount}</span>
+                        <i class="fas fa-arrow-right text-gray-600 text-xs"></i>
+                        <span class="${countClass}">${importCount}</span>
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        const warning = hasOverwrite ? `
+            <div class="bg-yellow-900/30 border border-yellow-500/50 rounded-lg p-3 mb-4 flex items-center gap-2">
+                <i class="fas fa-exclamation-triangle text-yellow-400"></i>
+                <span class="text-yellow-300 text-sm">警告: 导入将覆盖已有数据的存储</span>
+            </div>
+        ` : '';
+
+        content.innerHTML = `
+            <h3 class="text-lg font-bold text-white mb-2">
+                <i class="fas fa-file-import mr-2 text-torn-blue"></i>导入预览
+            </h3>
+            ${data._exportDate ? `<div class="text-gray-400 text-sm mb-4">备份时间: ${data._exportDate}</div>` : ''}
+            <div class="space-y-2 mb-4 max-h-48 overflow-y-auto">${storeRows}</div>
+            ${warning}
+            <div class="text-white mb-4">总导入记录数: ${totalImport}</div>
+            <div class="flex justify-end gap-2">
+                <button id="import-cancel" class="btn btn-secondary">取消</button>
+                <button id="import-confirm" class="btn btn-primary">确认导入</button>
+            </div>
+        `;
+
+        Utils.showModal(content);
+
+        content.querySelector('#import-cancel').addEventListener('click', () => Utils.hideModal());
+        content.querySelector('#import-confirm').addEventListener('click', async () => {
+            Utils.hideModal();
+            Utils.showLoading('正在导入数据...');
+            try {
+                await DB.importAll(data);
+                if (typeof TornAPI !== 'undefined') {
+                    TornAPI._key = null;
+                }
+                Utils.hideLoading();
+                Utils.toast('数据导入成功', 'success');
+                await this.loadSettings();
+                await this.render();
+                this.notifyAlarms();
+            } catch (e) {
+                Utils.hideLoading();
+                Utils.toast(`导入失败: ${e.message}`, 'error');
+            }
+        });
+    },
+
+    async exportData() {
+        try {
+            Utils.showLoading('正在导出数据...');
+            const data = await DB.exportAll();
+            const json = JSON.stringify(data, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `torn-company-backup-${Utils.todayKey()}.json`;
+            a.click();
+            URL.revokeObjectURL(url);
+            Utils.hideLoading();
+            Utils.toast('备份导出成功', 'success');
+        } catch (e) {
+            Utils.hideLoading();
+            Utils.toast(`导出失败: ${e.message}`, 'error');
+        }
+    },
+
+    clearAllData() {
+        const content = document.createElement('div');
+        content.className = 'p-6';
+        content.innerHTML = `
+            <h3 class="text-lg font-bold text-red-400 mb-2">
+                <i class="fas fa-exclamation-triangle mr-2"></i>清空所有数据
+            </h3>
+            <div class="text-gray-300 mb-4">
+                这将永久删除所有存储的数据，包括快照、交易记录、训练记录和设置。
+            </div>
+            <div class="text-red-300 text-sm mb-4 font-bold">此操作不可撤销！</div>
+            <div class="mb-4">
+                <label class="text-gray-400 text-sm mb-1 block">输入 "DELETE" 确认:</label>
+                <input id="clear-confirm-input" class="input" type="text" placeholder="DELETE">
+            </div>
+            <div class="flex justify-end gap-2">
+                <button id="clear-cancel" class="btn btn-secondary">取消</button>
+                <button id="clear-confirm" class="btn bg-red-600 hover:bg-red-700 text-white">删除所有数据</button>
+            </div>
+        `;
+
+        Utils.showModal(content);
+
+        content.querySelector('#clear-cancel').addEventListener('click', () => Utils.hideModal());
+        content.querySelector('#clear-confirm').addEventListener('click', async () => {
+            const inputVal = content.querySelector('#clear-confirm-input').value;
+            if (inputVal !== 'DELETE') {
+                Utils.toast('请输入 DELETE 确认', 'error');
+                return;
+            }
+            if (!confirm('确定要删除所有数据吗？此操作不可撤销。')) return;
+
+            Utils.hideModal();
+            Utils.showLoading('正在清空数据...');
+            try {
+                for (const store of ALL_STORES) {
+                    await DB.clear(store);
+                }
+                try {
+                    await chrome.storage.local.clear();
+                } catch (e) { /* ignore */ }
+                Utils.hideLoading();
+                Utils.toast('所有数据已清空', 'success');
+                await this.loadSettings();
+                await this.render();
+            } catch (e) {
+                Utils.hideLoading();
+                Utils.toast(`清空失败: ${e.message}`, 'error');
+            }
+        });
     }
 };

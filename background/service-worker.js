@@ -96,7 +96,7 @@ async function regenerateBoostSellerPoints() {
     for (const seller of all) {
       if ((seller.total_points || 0) <= 0) continue;
       if (seller.last_regen_date === today) continue;
-      seller.total_points = (seller.total_points || 0) + 10;
+      seller.total_points = (seller.total_points || 0) + 10; // BOOST_DAILY_REGEN (constants.js not available in SW scope)
       seller.last_regen_date = today;
       seller.last_updated = Date.now();
       store.put(seller);
@@ -111,8 +111,35 @@ async function regenerateBoostSellerPoints() {
 
 // Rehab status monitoring
 async function checkRehabStatus() {
-  const { apiKey } = await chrome.storage.local.get('apiKey');
+  const { apiKey, dash_addiction_threshold, addiction_alerts_history } = await chrome.storage.local.get([
+    'apiKey',
+    'dash_addiction_threshold',
+    'addiction_alerts_history'
+  ]);
   if (!apiKey) return;
+
+  const threshold = Math.abs(Number(dash_addiction_threshold)) || 5;
+  const today = new Date().toISOString().slice(0, 10);
+
+  // 获取今天已经去过瑞士康复的员工ID列表
+  let rehabbedTodayIds = new Set();
+  try {
+    const db = await openDB();
+    const tx = db.transaction('rehab_records', 'readonly');
+    const store = tx.objectStore('rehab_records');
+    const allRehabs = await new Promise((resolve) => {
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => resolve([]);
+    });
+    db.close();
+    
+    allRehabs
+      .filter(r => r.date === today)
+      .forEach(r => rehabbedTodayIds.add(String(r.player_id)));
+  } catch (err) {
+    console.error('Failed to load rehabbed players today:', err);
+  }
 
   try {
     // Get company employees
@@ -122,34 +149,57 @@ async function checkRehabStatus() {
 
     const employees = data.company_employees || {};
     const rehabAlerts = [];
+    const alertsHistory = addiction_alerts_history || {};
+    const updatedHistory = {};
 
     for (const [id, emp] of Object.entries(employees)) {
-      // Check if traveling to Switzerland (state: Traveling, destination includes Swiss)
-      if (emp.status && emp.status.state === 'Traveling') {
-        const desc = emp.status.description || '';
-        if (desc.includes('Switzerland') || desc.includes('瑞士')) {
-          rehabAlerts.push({
-            id: parseInt(id),
-            name: emp.name,
-            status: desc
-          });
-
-          // Record rehab event
-          await recordRehabEvent(parseInt(id), emp.name);
-        }
+      // 保持历史记录中仅包含当前在职员工，防止离职员工垃圾数据堆积
+      if (alertsHistory[id]) {
+        updatedHistory[id] = alertsHistory[id];
       }
+
+      // Check if traveling to Switzerland (state: Traveling, destination includes Swiss)
+      const isTravelingToSwiss = emp.status && 
+                                 emp.status.state === 'Traveling' && 
+                                 (emp.status.description?.includes('Switzerland') || emp.status.description?.includes('瑞士'));
+
+      if (isTravelingToSwiss) {
+        rehabAlerts.push({
+          id: parseInt(id),
+          name: emp.name,
+          status: emp.status.description || ''
+        });
+
+        // Record rehab event
+        await recordRehabEvent(parseInt(id), emp.name);
+        // 动态加入今日已去过瑞士名单，防止后续重复报警
+        rehabbedTodayIds.add(String(id));
+      }
+
+      const hasRehabbedToday = rehabbedTodayIds.has(String(id));
 
       // Also check for high addiction levels
-      if (emp.effectiveness && emp.effectiveness.addiction && emp.effectiveness.addiction <= -10) {
-        chrome.notifications.create(`addiction-${id}`, {
-          type: 'basic',
-          iconUrl: 'icons/icon128.png',
-          title: '⚠️ 员工毒瘾警告',
-          message: `${emp.name} 的毒瘾影响: ${emp.effectiveness.addiction}，建议关注`,
-          priority: 1
-        });
+      // 仅当员工今天没有去过瑞士（或不在去瑞士路上）时，才推送毒瘾弹窗提醒，提醒冷却为 6 小时
+      if (!isTravelingToSwiss && !hasRehabbedToday && emp.effectiveness && emp.effectiveness.addiction && emp.effectiveness.addiction <= -threshold) {
+        const now = Date.now();
+        const lastAlertTime = alertsHistory[id] || 0;
+        const cooldownMs = 6 * 60 * 60 * 1000; // 6小时间隔
+
+        if (now - lastAlertTime >= cooldownMs) {
+          chrome.notifications.create(`addiction-${id}`, {
+            type: 'basic',
+            iconUrl: 'icons/icon128.png',
+            title: '⚠️ 员工毒瘾警告',
+            message: `${emp.name} 的毒瘾影响: ${emp.effectiveness.addiction}，建议关注`,
+            priority: 1
+          });
+          updatedHistory[id] = now;
+        }
       }
     }
+
+    // 保存更新后的警报历史记录
+    await chrome.storage.local.set({ addiction_alerts_history: updatedHistory });
 
     // Send notification if rehab detected
     if (rehabAlerts.length > 0) {
@@ -198,10 +248,10 @@ async function recordRehabEvent(playerId, playerName) {
 }
 
 // IndexedDB helper for service worker
-// NOTE: DB version must match js/db.js DB_VERSION (currently 9)
+// NOTE: DB version must match js/db.js DB_VERSION (currently 11)
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('torn-company-manager', 9);
+    const req = indexedDB.open('torn-company-manager', 11);
     req.onupgradeneeded = (event) => {
       const db = event.target.result;
       const oldVersion = event.oldVersion;
@@ -237,6 +287,8 @@ function openDB() {
 async function refreshCompanyData() {
 const { apiKey } = await chrome.storage.local.get('apiKey');
 if (!apiKey) return;
+
+await checkAndSaveBus2110Education(apiKey);
 
 try {
   const resp = await fetch(`https://api.torn.com/company/?selections=profile,employees,stock,detailed&key=${apiKey}`);
@@ -280,3 +332,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 });
+
+async function checkAndSaveBus2110Education(apiKey) {
+  try {
+    const { has_bus2110 } = await chrome.storage.local.get('has_bus2110');
+    if (has_bus2110 === true) {
+      return;
+    }
+    const resp = await fetch(`https://api.torn.com/v2/user/education?key=${apiKey}`);
+    const eduData = await resp.json();
+    if (eduData && eduData.education && Array.isArray(eduData.education.complete)) {
+      if (eduData.education.complete.includes(11)) { // EDUCATION_IDS.BUS2110 (constants.js not available in SW scope)
+        await chrome.storage.local.set({ has_bus2110: true });
+        // Also write to IndexedDB settings store
+        try {
+          const db = await openDB();
+          const tx = db.transaction('settings', 'readwrite');
+          tx.objectStore('settings').put({ key: 'has_bus2110', value: true });
+          await new Promise((resolve) => { tx.oncomplete = resolve; tx.onerror = resolve; });
+          db.close();
+        } catch (dbErr) {
+          console.error('[SW] Failed to write has_bus2110 to IndexedDB:', dbErr);
+        }
+        console.log('[SW] Education BUS2110 detected and saved to persistent storage.');
+      }
+    }
+  } catch (err) {
+    console.error('[SW] checkAndSaveBus2110Education failed:', err);
+  }
+}

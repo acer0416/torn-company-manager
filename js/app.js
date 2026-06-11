@@ -25,6 +25,14 @@
     await new Promise(r => document.addEventListener('DOMContentLoaded', r));
   }
 
+  // Detect popup mode and apply class
+  const isPopup = !window.location.search.includes('mode=full') &&
+                  (typeof chrome !== 'undefined' && chrome.extension && chrome.extension.getViews);
+  if (isPopup) {
+    document.documentElement.classList.add('is-popup');
+    console.log('[App] Popup mode detected, is-popup class added');
+  }
+
   console.log('[App] Starting initialization...');
 
   // Initialize DB
@@ -51,11 +59,11 @@
     'dashboard': typeof DashboardPage !== 'undefined' ? DashboardPage : null,
     'employees': typeof EmployeePage !== 'undefined' ? EmployeePage : null,
     'training': typeof TrainingPage !== 'undefined' ? TrainingPage : null,
+    'training-planner': typeof TrainingPlannerPage !== 'undefined' ? TrainingPlannerPage : null,
     'stock': typeof StockPage !== 'undefined' ? StockPage : null,
     'finance': typeof FinancePage !== 'undefined' ? FinancePage : null,
     'rehab': typeof RehabPage !== 'undefined' ? RehabPage : null,
     'boost': typeof BoostPage !== 'undefined' ? BoostPage : null,
-    'data': typeof DataPage !== 'undefined' ? DataPage : null,
     'settings': typeof SettingsPage !== 'undefined' ? SettingsPage : null,
   };
 
@@ -135,17 +143,10 @@
 
   document.getElementById('btn-open-full')?.addEventListener('click', () => {
     try {
-      if (chrome.windows) {
-        chrome.windows.create({
-          url: chrome.runtime.getURL('popup/index.html'),
-          state: 'maximized'
-        });
-      } else {
-        // Firefox fallback: open as tab
-        chrome.tabs.create({ url: chrome.runtime.getURL('popup/index.html') });
-      }
+      chrome.tabs.create({ url: chrome.runtime.getURL('popup/index.html?mode=full') });
     } catch (e) {
-      window.open(window.location.href, '_blank');
+      const separator = window.location.href.includes('?') ? '&' : '?';
+      window.open(window.location.href + separator + 'mode=full', '_blank');
     }
   });
 

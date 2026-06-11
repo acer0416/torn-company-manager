@@ -2,7 +2,7 @@
 const DB = {
   db: null,
   DB_NAME: 'torn-company-manager',
-  DB_VERSION: 9,
+  DB_VERSION: 11,
 
   async init() {
     return new Promise((resolve, reject) => {
@@ -114,6 +114,16 @@ const DB = {
           tfaStore.createIndex('weekKey', 'weekKey', { unique: false });
           tfaStore.createIndex('createdAt', 'createdAt', { unique: false });
         }
+        // Rehab API snapshots (v10)
+        if (!db.objectStoreNames.contains('rehab_api_snapshots')) {
+          const rasStore = db.createObjectStore('rehab_api_snapshots', { keyPath: 'id', autoIncrement: true });
+          rasStore.createIndex('player_id', 'player_id');
+          rasStore.createIndex('date', 'date');
+        }
+        // Talents pool (v11)
+        if (!db.objectStoreNames.contains('talents')) {
+          db.createObjectStore('talents', { keyPath: 'player_id' });
+        }
         // Add week_key index to existing transactions store (v3→v4 upgrade)
         if (db.objectStoreNames.contains('transactions')) {
           var txStore = e.target.transaction.objectStore('transactions');
@@ -199,11 +209,14 @@ const DB = {
 
   // Export all data
   async exportAll() {
-    const stores = ['snapshots', 'employee_history', 'stock_history', 'transactions',
+    const stores = [
+      'snapshots', 'employee_history', 'stock_history', 'transactions',
       'employee_notes', 'training_records', 'training_config', 'tax_config',
-      'rehab_records', 'rehab_config', 'boost_sellers', 'settings', 'employees_master',
-      'tax_weeks', 'tax_carryover', 'employee_tax', 'employee_tax_rates',
-      'merit_history', 'train_fund_allocations'];
+      'rehab_records', 'rehab_config', 'boost_sellers', 'company_types', 'settings',
+      'employees_master', 'tax_weeks', 'tax_carryover', 'employee_tax',
+      'employee_tax_rates', 'merit_history', 'train_fund_allocations',
+      'rehab_api_snapshots', 'talents'
+    ];
     const data = {};
     for (const store of stores) {
       data[store] = await this.getAll(store);
@@ -215,16 +228,21 @@ const DB = {
 
   // Import all data
   async importAll(data) {
-    const stores = ['snapshots', 'employee_history', 'stock_history', 'transactions',
+    const stores = [
+      'snapshots', 'employee_history', 'stock_history', 'transactions',
       'employee_notes', 'training_records', 'training_config', 'tax_config',
-      'rehab_records', 'rehab_config', 'boost_sellers', 'settings', 'employees_master',
-      'tax_weeks', 'tax_carryover', 'employee_tax', 'employee_tax_rates',
-      'merit_history', 'train_fund_allocations'];
+      'rehab_records', 'rehab_config', 'boost_sellers', 'company_types', 'settings',
+      'employees_master', 'tax_weeks', 'tax_carryover', 'employee_tax',
+      'employee_tax_rates', 'merit_history', 'train_fund_allocations',
+      'rehab_api_snapshots', 'talents'
+    ];
     for (const store of stores) {
-      if (data[store] && data[store].length) {
+      if (data[store] !== undefined) {
         await this.clear(store);
-        for (const item of data[store]) {
-          await this.put(store, item);
+        if (data[store] && data[store].length) {
+          for (const item of data[store]) {
+            await this.put(store, item);
+          }
         }
       }
     }
@@ -233,6 +251,26 @@ const DB = {
     if (!schemaVer || schemaVer.value < 4) {
       console.log('[DB] Imported data needs migration, running migrateV3toV4...');
       await this.migrateV3toV4();
+    }
+
+    // Sync settings to chrome.storage.local (service-worker replica)
+    if (data.settings && data.settings.length) {
+      try {
+        if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+          const syncObj = {};
+          for (const item of data.settings) {
+            if (item.key) {
+              syncObj[item.key] = item.value;
+            }
+          }
+          if (Object.keys(syncObj).length > 0) {
+            await chrome.storage.local.set(syncObj);
+            console.log('[DB] Synced settings to chrome.storage.local:', Object.keys(syncObj));
+          }
+        }
+      } catch (e) {
+        console.warn('[DB] Failed to sync settings to chrome.storage.local:', e);
+      }
     }
   },
   // Migrate data from v3 to v4: calculate week_key for tax transactions,

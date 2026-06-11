@@ -9,6 +9,7 @@ window.FinancePage = {
     taxWeeks: [],
     taxCarryovers: [],
     selectedWeekKey: '',
+    selectedMonthKey: '',
     employeeTaxList: [],
     employeeTaxRates: [],
 
@@ -28,8 +29,10 @@ window.FinancePage = {
 
     async init() {
         await this._loadData();
-        // 初始化周选择器状态
+        // 初始化周选择器和月选择器状态
         this.selectedWeekKey = Utils.weekKey(); // 默认为当前周
+        const now = new Date();
+        this.selectedMonthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
         // 检查未迁移的旧数据（无 week_key 的 tax 交易）
         var self = this;
         var unmigratedTxs = this.transactions.filter(function(tx) {
@@ -112,6 +115,8 @@ window.FinancePage = {
         this.taxCarryovers = await DB.getAll('tax_carryover') || [];
         this.employeeTaxList = await DB.getAll('employee_tax') || [];
         this.employeeTaxRates = await DB.getAll('employee_tax_rates') || [];
+        this._stockHistory = (await DB.getAll('stock_history')) || [];
+        this._snapshots = (await DB.getAll('snapshots')) || [];
 
         // 重置员工列表，防止 _loadData() 被多次调用时累积重复数据
         this.employees = [];
@@ -226,14 +231,41 @@ window.FinancePage = {
         } catch (e) {
             this._overviewStock = [];
         }
+
+        // Load configurations for daily projections of Boost, Tax, and Training
+        try {
+            this._boostSellers = await DB.getAll('boost_sellers') || [];
+        } catch (e) {
+            this._boostSellers = [];
+        }
+
+        try {
+            const freeTrainsCfg = await DB.get('training_config', 'weekly_free_trains');
+            const priceCfg = await DB.get('training_config', 'train_price');
+            const availCfg = await DB.get('training_config', 'weekly_available_trains');
+
+            const freeTrains = freeTrainsCfg?.value ?? 0;
+            const trainPrice = priceCfg?.value ?? DEFAULT_TRAIN_PRICE;
+            const availTrains = availCfg?.value ?? 0;
+
+            const activeCount = (this.employees || []).filter(e => !e.left_date).length;
+            const totalFreeTrains = freeTrains * activeCount;
+            const sellableCount = Math.max(0, availTrains - totalFreeTrains);
+            this._projDailyTrain = (sellableCount * trainPrice) / 7;
+        } catch (e) {
+            this._projDailyTrain = 0;
+        }
     },
 
     // ========== 周税务状态层函数 ==========
 
     _getWeeklyActiveEmployees: function(weekKey) {
         var range = Utils.weekDateRange(weekKey);
-        var weekStartStr = Utils.todayKey(range.start);
-        var weekEndStr = Utils.todayKey(range.end);
+        var formatDateStr = function(d) {
+            return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+        };
+        var weekStartStr = formatDateStr(range.start);
+        var weekEndStr = formatDateStr(range.end);
         
         return (this.employees || []).filter(function(emp) {
             var firstSeen = emp.first_seen || '1970-01-01';
@@ -299,7 +331,20 @@ window.FinancePage = {
         // 计算应缴税额
         var taxDue = 0;
         if (this.config && this.config.weekly_tax_enabled) {
-            taxDue = (Number(this.config.weekly_tax_amount) || 0) * employeeCount;
+            var range = Utils.weekDateRange(weekKey);
+            var formatDateStr = function(d) {
+                return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+            };
+            var weekEndStr = formatDateStr(range.end);
+
+            for (var i = 0; i < activeEmployees.length; i++) {
+                var emp = activeEmployees[i];
+                // 如果员工已离职，不计入应缴税额中
+                if (emp.left_date && emp.left_date <= weekEndStr) {
+                    continue;
+                }
+                taxDue += this._getEmployeeTaxRate(emp.player_id);
+            }
         }
         
         // 获取结转转入（从 tax_carryover 计算）
@@ -394,16 +439,30 @@ window.FinancePage = {
             await DB.delete('employee_tax', oldRecords[o].id);
         }
 
-        // 创建新记录
-        var allIdsArr = Array.from(allEmployeeIds);
+        var range = Utils.weekDateRange(weekKey);
+        var formatDateStr = function(d) {
+            return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+        };
+        var weekStartStr = formatDateStr(range.start);
+        var weekEndStr = formatDateStr(range.end);
+
+        // 强硬隔离：过滤掉早在本周之前就已经离职的员工（即使有历史结转，也强制截断不显示）
+        var allIdsArr = Array.from(allEmployeeIds).filter(function(pid) {
+            var emp = self.employees.find(function(em) { return String(em.player_id) === String(pid); });
+            if (emp && emp.left_date && emp.left_date < weekStartStr) {
+                return false;
+            }
+            return true;
+        });
+        var writtenOffMap = {};
         for (var e = 0; e < allIdsArr.length; e++) {
             var playerId = allIdsArr[e];
             var emp = empList.find(function(em) { return String(em.player_id) === playerId; });
-            var name = emp ? emp.name : (paidByEmployee[playerId] ? paidByEmployee[playerId].name : 'Unknown');
+            var allEmp = self.employees.find(function(em) { return String(em.player_id) === playerId; });
+            var name = emp ? emp.name : (allEmp ? allEmp.name : (paidByEmployee[playerId] ? paidByEmployee[playerId].name : 'Unknown'));
             var paid = paidByEmployee[playerId] ? paidByEmployee[playerId].paid : 0;
-            var taxAmount = self._getEmployeeTaxRate(playerId);
 
-            // 检查是否有旧的销账状态需要保留
+            // 检查是否有旧的记录需要保留状态（销账、手动指定的应缴税）
             var oldRec = null;
             for (var or = 0; or < oldRecords.length; or++) {
                 if (String(oldRecords[or].player_id) === playerId) {
@@ -411,11 +470,21 @@ window.FinancePage = {
                     break;
                 }
             }
+
+            var taxAmount;
+            if (oldRec && oldRec.is_manual_tax) {
+                taxAmount = oldRec.tax_amount;
+            } else {
+                var isResigned = allEmp && allEmp.left_date && allEmp.left_date <= weekEndStr;
+                taxAmount = (emp && !isResigned) ? self._getEmployeeTaxRate(playerId) : 0;
+            }
+
             var isWrittenOff = oldRec ? oldRec.is_written_off : false;
             var writtenOffAt = oldRec ? oldRec.written_off_at : null;
 
-            // 如果已销账但后来实缴超过了应缴，自动取消销账
-            var finalWrittenOff = isWrittenOff && (paid >= taxAmount) ? false : isWrittenOff;
+            // 如果曾因欠费销账，但后来实缴超过了应缴，自动取消销账；如果是盈余销账，则保留销账状态
+            var finalWrittenOff = isWrittenOff && (taxAmount > 0 && paid >= taxAmount) ? false : isWrittenOff;
+            writtenOffMap[playerId] = finalWrittenOff;
 
             await DB.put('employee_tax', {
                 week_key: weekKey,
@@ -425,17 +494,25 @@ window.FinancePage = {
                 paid_amount: paid,
                 is_written_off: finalWrittenOff,
                 written_off_at: finalWrittenOff ? writtenOffAt : null,
+                is_manual_tax: oldRec ? !!oldRec.is_manual_tax : false,
                 calculated_at: Date.now()
             });
         }
 
         // --- 构建 per_employee_surplus 并创建/更新自动结转记录 ---
         var perEmployeeSurplus = {};
-        var allIdsArr2 = Array.from(allEmployeeIds);
+        var allIdsArr2 = allIdsArr;
         for (var es = 0; es < allIdsArr2.length; es++) {
             var spid = allIdsArr2[es];
             var spaid = paidByEmployee[spid] ? paidByEmployee[spid].paid : 0;
-            var sTaxAmount = self._getEmployeeTaxRate(spid);
+            var sEmp = empList.find(function(em) { return String(em.player_id) === String(spid); });
+            var sTaxAmount = sEmp ? self._getEmployeeTaxRate(spid) : 0;
+            
+            // 如果已经被销账，则不再产生结转转出！
+            if (writtenOffMap[spid]) {
+                continue;
+            }
+
             var surplus = Math.max(0, spaid - sTaxAmount);
             if (surplus > 0) {
                 perEmployeeSurplus[spid] = surplus;
@@ -499,6 +576,12 @@ window.FinancePage = {
         });
         var activeEmployees = this._getWeeklyActiveEmployees(weekKey);
 
+        var range = Utils.weekDateRange(weekKey);
+        var formatDateStr = function(d) {
+            return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+        };
+        var weekEndStr = formatDateStr(range.end);
+
         var needPay = 0;
         var resolved = 0;
 
@@ -506,7 +589,7 @@ window.FinancePage = {
             var emp = activeEmployees[i];
             var pid = String(emp.player_id);
             var row = records.find(function(r) { return String(r.player_id) === pid; });
-            var taxAmt = row != null ? Number(row.tax_amount) : this._getEmployeeTaxRate(pid);
+            var taxAmt = row != null ? Number(row.tax_amount) : (emp.left_date && emp.left_date <= weekEndStr ? 0 : this._getEmployeeTaxRate(pid));
             if (taxAmt <= 0) continue;
             needPay++;
             var paidAmt = row ? Number(row.paid_amount) || 0 : 0;
@@ -559,6 +642,38 @@ window.FinancePage = {
         });
         var keys = Array.from(weekKeys).sort();
         return keys;
+    },
+
+    // 根据实际页面大小获取最适合并排显示的周数量
+    _getOptimalWeekCount: function() {
+        var w = window.innerWidth;
+        if (w < 850) return 3;
+        if (w < 1050) return 4;
+        if (w < 1250) return 5;
+        if (w < 1450) return 6;
+        return 7;
+    },
+
+    // 获取从最早的有记录周到当前周的连续周 Key 列表
+    _getContinuousWeekKeys: function() {
+        var knownKeys = this._getAllWeekKeys();
+        var currentWeek = Utils.weekKey();
+        if (knownKeys.length === 0) {
+            return [currentWeek];
+        }
+        var startWeek = knownKeys[0];
+        var keys = [];
+        var tempWeek = startWeek;
+        var maxSafety = 156; // 安全阈值，最多 3 年
+        while (tempWeek <= currentWeek && maxSafety > 0) {
+            keys.push(tempWeek);
+            tempWeek = Utils.weekKeyAdd(tempWeek, 1);
+            maxSafety--;
+        }
+        if (!keys.includes(currentWeek)) {
+            keys.push(currentWeek);
+        }
+        return keys.sort();
     },
 
     // 结转处理：将指定周的超额缴纳结转至下周
@@ -676,8 +791,8 @@ window.FinancePage = {
                 if (!this._isTaxTx(tx)) continue;
                 
                 var oldWeekKey = tx.week_key;
-                // force=true: 忽略已有 week_key，始终从 timestamp 重算
-                var newWeekKey = this._autoMatchWeek(tx, true);
+                // force=false: 不忽略已有 week_key，保留手动分配
+                var newWeekKey = this._autoMatchWeek(tx, false);
                 
                 // 标记旧周受影响（交易从旧周移出）
                 if (oldWeekKey && oldWeekKey !== '__unassigned__') {
@@ -733,6 +848,12 @@ window.FinancePage = {
         var self = this;
         var weekKey = this.selectedWeekKey;
 
+        var range = Utils.weekDateRange(weekKey);
+        var formatDateStr = function(d) {
+            return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+        };
+        var weekEndStr = formatDateStr(range.end);
+
         // 获取当前周员工税务记录
         var empTaxRecords = this.employeeTaxList.filter(function(r) {
             return r.week_key === weekKey;
@@ -755,11 +876,12 @@ window.FinancePage = {
             var emp = activeEmployees[j];
             var pid = String(emp.player_id);
             if (!seenPlayerIds[pid]) {
+                var isResigned = emp.left_date && emp.left_date <= weekEndStr;
                 displayedRecords.push({
                     week_key: weekKey,
                     player_id: pid,
                     player_name: emp.name || 'Unknown',
-                    tax_amount: self._getEmployeeTaxRate(pid),
+                    tax_amount: isResigned ? 0 : self._getEmployeeTaxRate(pid),
                     paid_amount: 0,
                     is_written_off: false,
                     written_off_at: null
@@ -772,8 +894,16 @@ window.FinancePage = {
             return '<p class="text-xs text-gray-500 text-center py-4">暂无员工纳税数据</p>';
         }
 
-        // 按名称排序
+        // 先按是否在职排序（在职优先，离职排最后），然后按名称排序
         displayedRecords.sort(function(a, b) {
+            var empA = self.employees.find(function(e) { return String(e.player_id) === String(a.player_id); });
+            var empB = self.employees.find(function(e) { return String(e.player_id) === String(b.player_id); });
+            var activeA = empA ? !empA.left_date : true;
+            var activeB = empB ? !empB.left_date : true;
+
+            if (activeA !== activeB) {
+                return activeA ? -1 : 1;
+            }
             return (a.player_name || '').localeCompare(b.player_name || '');
         });
 
@@ -787,6 +917,7 @@ window.FinancePage = {
         html += '<div class="emp-tax-header">';
         html += '<div class="emp-tax-col-dot"></div>';
         html += '<div>员工</div>';
+        html += '<div class="text-center">在职</div>';
         html += '<div class="text-right">应缴</div>';
         html += '<div class="text-right">已缴</div>';
         html += '<div class="text-right">差额</div>';
@@ -813,10 +944,16 @@ window.FinancePage = {
                 dotClass = 'status-dot-writeoff';
                 statusText = '📋 已销账';
                 statusBadgeClass = 'emp-tax-status-writeoff';
-            } else if (paidAmt >= taxAmt && taxAmt > 0) {
-                dotClass = 'status-dot-paid';
-                statusText = '✅ 已缴清';
-                statusBadgeClass = 'emp-tax-status-paid';
+            } else if (paidAmt >= taxAmt) {
+                if (taxAmt === 0 && paidAmt > 0) {
+                    dotClass = 'status-dot-paid';
+                    statusText = '✨ 结余';
+                    statusBadgeClass = 'emp-tax-status-paid';
+                } else {
+                    dotClass = 'status-dot-paid';
+                    statusText = '✅ 已缴清';
+                    statusBadgeClass = 'emp-tax-status-paid';
+                }
             } else if (paidAmt <= 0) {
                 rowClass = 'emp-tax-row-unpaid';
                 dotClass = 'status-dot-unpaid';
@@ -838,6 +975,11 @@ window.FinancePage = {
             // 员工名
             var profileUrl = 'https://www.torn.com/profiles.php?XID=' + row.player_id;
             html += '<div class="truncate text-gray-200"><a href="' + profileUrl + '" target="_blank" class="text-torn-accent hover:underline">' + (row.player_name || 'Unknown') + '</a></div>';
+            // 是否在职
+            var emp = self.employees.find(function(e) { return String(e.player_id) === String(row.player_id); });
+            var isActive = emp ? !emp.left_date : true;
+            var activeText = isActive ? '<span class="text-green-400">在职</span>' : '<span class="text-gray-500">离职</span>';
+            html += '<div class="text-center">' + activeText + '</div>';
             // 应缴（可编辑）
             html += '<div class="text-right">';
             html += '<span class="emp-tax-amount-editable" data-action="edit-emp-tax" data-player-id="' + row.player_id + '" data-week-key="' + weekKey + '" title="点击编辑应缴税额">' + Utils.formatCurrency(taxAmt) + '</span>';
@@ -976,47 +1118,446 @@ window.FinancePage = {
 
     // ---- Tab: 财务概览 ----
 
+    _calculateRangeFinancials(startDate, endDate) {
+        var totalCost = 0;
+        var totalAdFee = 0;
+        var totalIncomeAPI = 0;
+        var totalTax = 0;
+        var totalCarryover = 0;
+        var totalTrain = 0;
+        var totalBoost = 0;
+        const dailyBreakdown = [];
+        const todayStr = Utils.todayKey();
+
+        const fin = Utils.resolveCompanyFinancials(this.latestSnapshot, this._overviewStock || []);
+        const projDailyCost = fin.dailyCost;
+        const projDailyAd = fin.weekAdFee / 7;
+        const projDailyIncome = fin.dailyIncome;
+
+        const projectedBoostDates = new Set();
+        const projectedBoostPrices = {};
+
+        // Find the latest boost transaction
+        const boostTxs = this.transactions.filter(t => t.category === 'boost');
+        let latestBoostTx = null;
+        if (boostTxs.length > 0) {
+            const sorted = [...boostTxs].sort((a, b) => {
+                if (a.date && b.date) {
+                    return b.date.localeCompare(a.date);
+                }
+                let tsa = a.timestamp || 0;
+                let tsb = b.timestamp || 0;
+                if (tsa > 0 && tsa < 100000000000) tsa *= 1000;
+                if (tsb > 0 && tsb < 100000000000) tsb *= 1000;
+                return tsb - tsa;
+            });
+            latestBoostTx = sorted[0];
+        }
+
+        let nextPurchaseDateStr = todayStr;
+        if (latestBoostTx && latestBoostTx.date) {
+            const parts = latestBoostTx.date.split('-');
+            if (parts.length === 3) {
+                let pDate = new Date(Date.UTC(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2])));
+                pDate.setUTCDate(pDate.getUTCDate() + 7);
+                let pDateStr = pDate.toISOString().slice(0, 10);
+                
+                // If it is in the past, advance by 7-day increments until >= todayStr
+                while (pDateStr < todayStr) {
+                    pDate.setUTCDate(pDate.getUTCDate() + 7);
+                    pDateStr = pDate.toISOString().slice(0, 10);
+                }
+                nextPurchaseDateStr = pDateStr;
+            }
+        }
+
+        // Initialize simulated seller points tracking
+        const simulatedSellers = (this._boostSellers || []).map(s => ({
+            id: s.id,
+            price_per_boost: Number(s.price_per_boost) || 0,
+            initialPoints: (Number(s.total_points) || 0) - (Number(s.points_used) || 0),
+            pointsPurchasedSimulated: 0
+        }));
+
+        // Fallback purchase price if no seller is qualified
+        let fallbackPurchasePrice = 30000000; // default $30m
+        if (boostTxs.length > 0) {
+            fallbackPurchasePrice = boostTxs.reduce((sum, t) => sum + t.amount, 0) / boostTxs.length;
+        }
+
+        // Generate projected purchase dates and choose cheapest qualified seller for each purchase date
+        let projDate = new Date(Date.UTC(
+            Number(nextPurchaseDateStr.slice(0, 4)),
+            Number(nextPurchaseDateStr.slice(5, 7)) - 1,
+            Number(nextPurchaseDateStr.slice(8, 10))
+        ));
+
+        for (let i = 0; i < 12; i++) {
+            const dateStr = projDate.toISOString().slice(0, 10);
+            
+            // Calculate elapsed days from today to this projected purchase date to estimate seller point regenerations
+            const daysElapsed = Math.max(0, Math.round((projDate - new Date(Date.UTC(
+                Number(todayStr.slice(0, 4)),
+                Number(todayStr.slice(5, 7)) - 1,
+                Number(todayStr.slice(8, 10))
+            ))) / (24 * 60 * 60 * 1000)));
+
+            // Find all qualified sellers with simulated points >= 250 on this date
+            const qualified = [];
+            for (const seller of simulatedSellers) {
+                if (seller.price_per_boost <= 0) continue;
+                // Job points increase by 10 points per day in TORN
+                const simulatedPoints = seller.initialPoints + daysElapsed * 10 - seller.pointsPurchasedSimulated;
+                if (simulatedPoints >= 250) {
+                    qualified.push(seller);
+                }
+            }
+
+            let chosenPrice = fallbackPurchasePrice;
+            if (qualified.length > 0) {
+                // Sort by price ascending to pick the cheapest qualified seller
+                qualified.sort((a, b) => a.price_per_boost - b.price_per_boost);
+                const chosenSeller = qualified[0];
+                chosenPrice = chosenSeller.price_per_boost;
+                // Deduct 250 points from this seller for subsequent purchases in the simulation
+                chosenSeller.pointsPurchasedSimulated += 250;
+            }
+
+            projectedBoostDates.add(dateStr);
+            projectedBoostPrices[dateStr] = chosenPrice;
+
+            projDate.setUTCDate(projDate.getUTCDate() + 7); // next purchase 7 days later
+        }
+
+        // Pre-calculate weekly actual tax transactions and weekly expected tax
+        const weekActualPaidMap = new Map();
+        const weekExpectedTaxMap = new Map();
+        const currentWeekKey = Utils.weekKey(new Date(todayStr + 'T00:00:00'));
+
+        // Group actual tax transactions by week key
+        for (const tx of this.transactions) {
+            if (this._isTaxTx(tx)) {
+                const wk = tx.week_key || Utils.weekKey(new Date(tx.date + 'T00:00:00'));
+                if (wk) {
+                    weekActualPaidMap.set(wk, (weekActualPaidMap.get(wk) || 0) + (Number(tx.amount) || 0));
+                }
+            }
+        }
+
+        const getWeeklyTaxTotal = (wk) => {
+            if (weekExpectedTaxMap.has(wk)) {
+                return weekExpectedTaxMap.get(wk);
+            }
+            let total = 0;
+            if (this.config && this.config.weekly_tax_enabled) {
+                const activeEmployees = this._getWeeklyActiveEmployees(wk);
+                const range = Utils.weekDateRange(wk);
+                const formatDateStr = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+                const weekEndStr = formatDateStr(range.end);
+                for (const emp of activeEmployees) {
+                    if (emp.left_date && emp.left_date <= weekEndStr) {
+                        continue;
+                    }
+                    total += this._getEmployeeTaxRate(emp.player_id);
+                }
+            }
+            weekExpectedTaxMap.set(wk, total);
+            return total;
+        };
+
+        const getUnpaidTaxFromRecords = (wk) => {
+            const weekRecords = (this.employeeTaxList || []).filter(r => r.week_key === wk);
+            if (weekRecords.length === 0) {
+                return null;
+            }
+
+            const range = Utils.weekDateRange(wk);
+            const formatDateStr = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+            const weekEndStr = formatDateStr(range.end);
+
+            let unpaidTotal = 0;
+            for (const r of weekRecords) {
+                if (r.is_written_off) {
+                    continue;
+                }
+                const emp = (this.employees || []).find(e => String(e.player_id) === String(r.player_id));
+                const isResigned = emp && emp.left_date && emp.left_date <= weekEndStr;
+                if (isResigned) {
+                    continue;
+                }
+                const due = Number(r.tax_amount) || 0;
+                const paid = Number(r.paid_amount) || 0;
+                unpaidTotal += Math.max(0, due - paid);
+            }
+            return unpaidTotal;
+        };
+
+        const getCarryoverAmount = (wk) => {
+            if (!this.config || !this.config.weekly_tax_enabled) {
+                return 0;
+            }
+
+            const incomingCarryovers = (this.taxCarryovers || []).filter(c => c.to_week_key === wk && !c.deleted);
+            if (incomingCarryovers.length === 0) {
+                return 0;
+            }
+
+            const carryoverEmpIds = new Set();
+            for (const ic of incomingCarryovers) {
+                const surplusMap = ic.per_employee_surplus;
+                if (surplusMap && typeof surplusMap === 'object') {
+                    for (const spid in surplusMap) {
+                        if (surplusMap.hasOwnProperty(spid) && (Number(surplusMap[spid]) || 0) > 0) {
+                            carryoverEmpIds.add(String(spid));
+                        }
+                    }
+                }
+            }
+
+            if (carryoverEmpIds.size === 0) {
+                return 0;
+            }
+
+            const range = Utils.weekDateRange(wk);
+            const formatDateStr = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+            const weekEndStr = formatDateStr(range.end);
+
+            let carryoverTotal = 0;
+            for (const pid of carryoverEmpIds) {
+                // Check if employee is resigned
+                const emp = (this.employees || []).find(e => String(e.player_id) === pid);
+                if (emp && emp.left_date && emp.left_date <= weekEndStr) {
+                    continue; // Skip if resigned
+                }
+                
+                // Check if employee tax record is written off in this week
+                const weekRecords = (this.employeeTaxList || []).filter(r => r.week_key === wk && String(r.player_id) === pid);
+                if (weekRecords.length > 0 && weekRecords[0].is_written_off) {
+                    continue; // Skip if written off
+                }
+
+                carryoverTotal += this._getEmployeeTaxRate(pid);
+            }
+            return carryoverTotal;
+        };
+
+        const start = new Date(Date.UTC(startDate.getFullYear(), startDate.getMonth(), startDate.getDate()));
+        const end = new Date(Date.UTC(endDate.getFullYear(), endDate.getMonth(), endDate.getDate()));
+
+        const stockHistory = this._stockHistory || [];
+        const snapshots = this._snapshots || [];
+
+        for (let d = new Date(start.getTime()); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+            const dateStr = d.toISOString().slice(0, 10);
+
+            // 1. Stock cost & Ad budget
+            let dayCost = 0;
+            let dayAd = 0;
+            let isCostReal = false;
+            let isAdReal = false;
+
+            const dayHistory = stockHistory.filter(h => h.date === dateStr);
+            if (dayHistory.length > 0) {
+                dayHistory.forEach(h => {
+                    dayCost += (Number(h.sold_amount) || 0) * (Number(h.cost) || 0);
+                });
+                dayAd = Number(dayHistory[0].ad_budget) || 0;
+                isCostReal = true;
+                isAdReal = true;
+            } else {
+                if (dateStr >= todayStr) {
+                    dayCost = projDailyCost;
+                    dayAd = projDailyAd;
+                }
+            }
+            totalCost += dayCost;
+            totalAdFee += dayAd;
+
+            // 2. Company Daily Income
+            let dayIncome = 0;
+            let isIncomeReal = false;
+            const daySnapshot = snapshots.find(s => s.date === dateStr);
+            if (daySnapshot) {
+                const profile = daySnapshot.profile || {};
+                const detailed = daySnapshot.detailed || {};
+                dayIncome = Number(profile.daily_income ?? detailed.daily_income) || 0;
+                if (dayIncome > 0) {
+                    isIncomeReal = true;
+                } else {
+                    const weekIncome = Number(profile.weekly_income ?? detailed.weekly_income) || 0;
+                    if (weekIncome > 0) {
+                        dayIncome = weekIncome / 7;
+                        isIncomeReal = true;
+                    } else {
+                        dayIncome = projDailyIncome;
+                    }
+                }
+            } else {
+                if (dateStr >= todayStr) {
+                    dayIncome = projDailyIncome;
+                }
+            }
+            totalIncomeAPI += dayIncome;
+
+            // 3. Boost Expenses
+            let dayBoost = 0;
+            let isBoostReal = false;
+            const dayBoostTxs = this.transactions.filter(tx => tx.category === 'boost' && tx.date === dateStr);
+            if (dayBoostTxs.length > 0) {
+                dayBoost = dayBoostTxs.reduce((sum, tx) => sum + tx.amount, 0);
+                isBoostReal = true;
+            } else {
+                if (dateStr >= todayStr) {
+                    dayBoost = projectedBoostDates.has(dateStr) ? (projectedBoostPrices[dateStr] || 0) : 0;
+                }
+            }
+            totalBoost += dayBoost;
+
+            // 4. Tax Income
+            let dayTax = 0;
+            let isTaxReal = false;
+            let isTaxProj = false;
+            const dayTaxTxs = this.transactions.filter(tx => this._isTaxTx(tx) && tx.date === dateStr);
+            if (dayTaxTxs.length > 0) {
+                dayTax = dayTaxTxs.reduce((sum, tx) => sum + tx.amount, 0);
+                isTaxReal = true;
+            }
+
+            const weekKey = Utils.weekKey(new Date(dateStr + 'T00:00:00'));
+            const isMonday = d.getUTCDay() === 1;
+
+            if (isMonday && weekKey >= currentWeekKey) {
+                let unpaidAmount = 0;
+                const unpaidFromRecords = getUnpaidTaxFromRecords(weekKey);
+                if (unpaidFromRecords !== null) {
+                    unpaidAmount = unpaidFromRecords;
+                } else {
+                    const weeklyTaxTotal = getWeeklyTaxTotal(weekKey);
+                    const actualPaid = weekActualPaidMap.get(weekKey) || 0;
+                    unpaidAmount = Math.max(0, weeklyTaxTotal - actualPaid);
+                }
+                if (unpaidAmount > 0) {
+                    dayTax += unpaidAmount;
+                    isTaxProj = true;
+                }
+            }
+            totalTax += dayTax;
+
+            // 4b. Carryover Income
+            let dayCarryover = 0;
+            if (isMonday) {
+                dayCarryover = getCarryoverAmount(weekKey);
+            }
+            totalCarryover += dayCarryover;
+
+            // 5. Training Income
+            let dayTrain = 0;
+            let isTrainReal = false;
+            const dayTrainTxs = this.transactions.filter(tx => tx.category === 'train' && tx.date === dateStr);
+            if (dayTrainTxs.length > 0) {
+                dayTrain = dayTrainTxs.reduce((sum, tx) => sum + tx.amount, 0);
+                isTrainReal = true;
+            } else {
+                if (dateStr >= todayStr) {
+                    dayTrain = this._projDailyTrain || 0;
+                }
+            }
+            totalTrain += dayTrain;
+
+            dailyBreakdown.push({
+                date: dateStr,
+                cost: dayCost,
+                isCostReal: isCostReal,
+                adFee: dayAd,
+                isAdReal: isAdReal,
+                income: dayIncome,
+                isIncomeReal: isIncomeReal,
+                boost: dayBoost,
+                isBoostReal: isBoostReal,
+                tax: dayTax,
+                isTaxReal: isTaxReal,
+                isTaxProj: isTaxProj,
+                carryover: dayCarryover,
+                train: dayTrain,
+                isTrainReal: isTrainReal
+            });
+        }
+
+        return {
+            cost: totalCost,
+            adFee: totalAdFee,
+            income: totalIncomeAPI,
+            tax: totalTax,
+            carryover: totalCarryover,
+            train: totalTrain,
+            boost: totalBoost,
+            dailyBreakdown: dailyBreakdown
+        };
+    },
+
     _overviewTabHTML() {
         const now = new Date();
         const startOfWeek = Utils.startOfCalendarWeek(now);
+        const endOfWeek = new Date(startOfWeek);
+        endOfWeek.setDate(startOfWeek.getDate() + 6);
 
-        const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+        const monthParts = this.selectedMonthKey.split('-');
+        const monthYear = parseInt(monthParts[0], 10);
+        const monthVal = parseInt(monthParts[1], 10);
+        const startOfMonth = new Date(monthYear, monthVal - 1, 1);
+        const endOfMonth = new Date(monthYear, monthVal, 0);
 
-        // Calculate transaction sums
-        let weekTax = 0, weekTrain = 0, weekBoost = 0, weekOther = 0;
-        let monthTax = 0, monthTrain = 0, monthBoost = 0, monthOther = 0;
+        // Calculate other transaction sums
+        let weekOther = 0;
+        let monthOther = 0;
 
         for (const tx of this.transactions) {
             let ts = tx.timestamp || 0;
             if (ts > 0 && ts < 100000000000) ts *= 1000; // normalize seconds to ms
 
-            if (ts >= startOfWeek.getTime()) {
-                if (this._isTaxTx(tx)) weekTax += tx.amount;
-                else if (tx.category === 'train') weekTrain += tx.amount;
-                else if (tx.category === 'boost') weekBoost += tx.amount;
-                else weekOther += tx.amount;
+            if (ts >= startOfWeek.getTime() && ts <= endOfWeek.getTime() + 86399999) {
+                if (!this._isTaxTx(tx) && tx.category !== 'train' && tx.category !== 'boost') {
+                    weekOther += tx.amount;
+                }
             }
-            if (ts >= startOfMonth.getTime()) {
-                if (this._isTaxTx(tx)) monthTax += tx.amount;
-                else if (tx.category === 'train') monthTrain += tx.amount;
-                else if (tx.category === 'boost') monthBoost += tx.amount;
-                else monthOther += tx.amount;
+            if (ts >= startOfMonth.getTime() && ts <= endOfMonth.getTime() + 86399999) {
+                if (!this._isTaxTx(tx) && tx.category !== 'train' && tx.category !== 'boost') {
+                    monthOther += tx.amount;
+                }
             }
         }
 
-        const fin = Utils.resolveCompanyFinancials(this.latestSnapshot, this._overviewStock || []);
-        const weekIncomeAPI = fin.weekIncome;
-        const weekCostAPI = fin.weekCost;
-        const weekAdFeeAPI = fin.weekAdFee;
+        // Calculate Weekly using hybrid logic (real history + projections)
+        const weekFin = this._calculateRangeFinancials(startOfWeek, endOfWeek);
+        const weekIncomeAPI = weekFin.income;
+        const weekCostAPI = weekFin.cost;
+        const weekAdFeeAPI = weekFin.adFee;
+        const weekTax = weekFin.tax;
+        const weekCarryover = weekFin.carryover;
+        const weekTrain = weekFin.train;
+        const weekBoost = weekFin.boost;
 
-        const weekTotalIncome = weekTax + weekTrain + weekOther + weekIncomeAPI;
+        const weekTotalIncome = weekTax + weekTrain + weekOther + weekIncomeAPI + weekCarryover;
         const weekTotalExpense = weekBoost + weekCostAPI + weekAdFeeAPI;
         const weekNetProfit = weekTotalIncome - weekTotalExpense;
 
-        // Calculate Monthly (当月已发生的数据 + 本周的预测数据)
-        const monthTotalIncome = monthTax + monthTrain + monthOther + weekIncomeAPI;
-        const monthTotalExpense = monthBoost + weekCostAPI + weekAdFeeAPI;
+        // Calculate Monthly using hybrid logic (real history + projections)
+        const monthFin = this._calculateRangeFinancials(startOfMonth, endOfMonth);
+        const monthIncomeAPI = monthFin.income;
+        const monthCostAPI = monthFin.cost;
+        const monthAdFeeAPI = monthFin.adFee;
+        const monthTax = monthFin.tax;
+        const monthCarryover = monthFin.carryover;
+        const monthTrain = monthFin.train;
+        const monthBoost = monthFin.boost;
+
+        const monthTotalIncome = monthTax + monthTrain + monthOther + monthIncomeAPI + monthCarryover;
+        const monthTotalExpense = monthBoost + monthCostAPI + monthAdFeeAPI;
         const monthNetProfit = monthTotalIncome - monthTotalExpense;
+
+        const isCurrentMonth = this.selectedMonthKey === this._getCurrentMonthKey();
+        const nextDisabledClass = isCurrentMonth ? 'opacity-50 cursor-not-allowed' : '';
+        const nextDisabledAttr = isCurrentMonth ? ' disabled' : '';
 
         return `
             <div class="card mb-6">
@@ -1035,15 +1576,15 @@ window.FinancePage = {
                         <h4 class="text-md font-bold text-red-400 border-b border-torn-border pb-2 mb-3">本周支出明细</h4>
                         <div class="space-y-2 text-sm">
                             <div class="flex justify-between text-gray-300">
-                                <span>商品成本预估 (API计算):</span>
+                                <span class="cursor-help border-b border-dashed border-gray-600" data-tooltip-right="记录+预测">商品成本:</span>
                                 <span class="font-mono text-white">${Utils.formatMoney(weekCostAPI)}</span>
                             </div>
                             <div class="flex justify-between text-gray-300">
-                                <span>广告费预估 (API):</span>
+                                <span class="cursor-help border-b border-dashed border-gray-600" data-tooltip-right="记录+预测">广告费:</span>
                                 <span class="font-mono text-white">${Utils.formatMoney(weekAdFeeAPI)}</span>
                             </div>
                             <div class="flex justify-between text-gray-300">
-                                <span>购买 Boost 记录 (手动/日志):</span>
+                                <span class="cursor-help border-b border-dashed border-gray-600" data-tooltip-right="记录+预测">Boost 支出:</span>
                                 <span class="font-mono text-white">${Utils.formatMoney(weekBoost)}</span>
                             </div>
                         </div>
@@ -1054,19 +1595,23 @@ window.FinancePage = {
                         <h4 class="text-md font-bold text-torn-green border-b border-torn-border pb-2 mb-3">本周收入明细</h4>
                         <div class="space-y-2 text-sm">
                             <div class="flex justify-between text-gray-300">
-                                <span>员工税费 (记录):</span>
+                                <span class="cursor-help border-b border-dashed border-gray-600" data-tooltip-right="记录+预测">员工税费:</span>
                                 <span class="font-mono text-white">${Utils.formatMoney(weekTax)}</span>
                             </div>
                             <div class="flex justify-between text-gray-300">
-                                <span>员工训练费 (记录):</span>
+                                <span>结转项:</span>
+                                <span class="font-mono text-white">${Utils.formatMoney(weekCarryover)}</span>
+                            </div>
+                            <div class="flex justify-between text-gray-300">
+                                <span class="cursor-help border-b border-dashed border-gray-600" data-tooltip-right="记录+预测">员工训练费:</span>
                                 <span class="font-mono text-white">${Utils.formatMoney(weekTrain)}</span>
                             </div>
                             <div class="flex justify-between text-gray-300">
-                                <span>其他收入 (记录):</span>
+                                <span>其他收入:</span>
                                 <span class="font-mono text-white">${Utils.formatMoney(weekOther)}</span>
                             </div>
                             <div class="flex justify-between text-gray-300">
-                                <span>公司收入 (API 周):</span>
+                                <span class="cursor-help border-b border-dashed border-gray-600" data-tooltip-right="记录+预测">公司收入:</span>
                                 <span class="font-mono text-white">${Utils.formatMoney(weekIncomeAPI)}</span>
                             </div>
                         </div>
@@ -1076,16 +1621,28 @@ window.FinancePage = {
 
             <!-- Monthly Overview -->
             <div class="card">
-                <h3 class="text-lg font-bold text-white mb-4">
-                    <i class="fas fa-calendar-alt mr-2 text-torn-accent"></i>月度概览 (日历月预估)
-                </h3>
+                <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+                    <h3 class="text-lg font-bold text-white">
+                        <i class="fas fa-calendar-alt mr-2 text-torn-accent"></i>月度概览 (日历月预估)
+                    </h3>
+                    <div class="flex items-center gap-2">
+                        <button class="btn btn-xs btn-secondary" data-action="prev-month" title="上一个月">
+                            <i class="fas fa-chevron-left"></i>
+                        </button>
+                        <span class="text-sm font-semibold text-torn-accent font-mono min-w-[70px] text-center" id="month-label-text">${this.selectedMonthKey}</span>
+                        <button class="btn btn-xs btn-secondary ${nextDisabledClass}" data-action="next-month"${nextDisabledAttr} title="下一个月">
+                            <i class="fas fa-chevron-right"></i>
+                        </button>
+                        ${!isCurrentMonth ? `<button class="btn btn-xs btn-primary ml-1" data-action="goto-current-month">本月</button>` : ''}
+                    </div>
+                </div>
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
-                    <div class="p-3 bg-torn-surface border border-torn-border rounded text-center">
-                        <div class="text-gray-400 text-xs mb-1">月度总支出预估</div>
+                    <div class="p-3 bg-torn-surface border border-torn-border rounded text-center cursor-pointer hover:border-torn-accent transition-colors" data-action="view-month-expense" title="点击查看计算明细">
+                        <div class="text-gray-400 text-xs mb-1">月度总支出预估 <i class="fas fa-search-plus text-xs ml-1 opacity-70"></i></div>
                         <div class="text-red-400 font-bold">${Utils.formatMoney(monthTotalExpense)}</div>
                     </div>
-                    <div class="p-3 bg-torn-surface border border-torn-border rounded text-center">
-                        <div class="text-gray-400 text-xs mb-1">月度总收入预估</div>
+                    <div class="p-3 bg-torn-surface border border-torn-border rounded text-center cursor-pointer hover:border-torn-accent transition-colors" data-action="view-month-income" title="点击查看计算明细">
+                        <div class="text-gray-400 text-xs mb-1">月度总收入预估 <i class="fas fa-search-plus text-xs ml-1 opacity-70"></i></div>
                         <div class="text-torn-green font-bold">${Utils.formatMoney(monthTotalIncome)}</div>
                     </div>
                     <div class="p-3 bg-torn-surface border border-torn-border rounded text-center">
@@ -1093,15 +1650,514 @@ window.FinancePage = {
                         <div class="${monthNetProfit >= 0 ? 'text-torn-gold' : 'text-red-400'} font-bold">${Utils.formatMoney(monthNetProfit)}</div>
                     </div>
                 </div>
-                <div class="text-xs text-gray-500 text-right">计算公式：当月实际交易记录 + 本周API预测数据</div>
+                <div class="text-xs text-gray-500 text-right">计算公式：当月实际交易记录 + 公司API历史与预测数据</div>
             </div>
         `;
+    },
+
+    async _showMonthExpenseDetails() {
+        const monthParts = this.selectedMonthKey.split('-');
+        const monthYear = parseInt(monthParts[0], 10);
+        const monthVal = parseInt(monthParts[1], 10);
+        const startOfMonth = new Date(monthYear, monthVal - 1, 1);
+        const endOfMonth = new Date(monthYear, monthVal, 0);
+
+        const monthFin = this._calculateRangeFinancials(startOfMonth, endOfMonth);
+        const monthBoost = monthFin.boost;
+        const monthTotalExpense = monthBoost + monthFin.cost + monthFin.adFee;
+        
+        const monthTxs = this.transactions.filter(tx => {
+            let ts = tx.timestamp || 0;
+            if (ts > 0 && ts < 100000000000) ts *= 1000;
+            return ts >= startOfMonth.getTime() && ts <= endOfMonth.getTime() + 86399999;
+        });
+        const boostTxs = monthTxs.filter(tx => tx.category === 'boost');
+
+        // Group dailyBreakdown by week keys (store full day objects for drill-down)
+        const weeklyBreakdown = {};
+        monthFin.dailyBreakdown.forEach(day => {
+            const parts = day.date.split('-');
+            const dt = new Date(Date.UTC(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2])));
+            const wk = Utils.weekKey(dt);
+            if (!weeklyBreakdown[wk]) {
+                weeklyBreakdown[wk] = {
+                    weekKey: wk,
+                    cost: 0,
+                    hasCostProj: false,
+                    hasCostReal: false,
+                    adFee: 0,
+                    hasAdProj: false,
+                    hasAdReal: false,
+                    boost: 0,
+                    hasBoostProj: false,
+                    hasBoostReal: false,
+                    days: [],
+                    dayObjects: []
+                };
+            }
+            const w = weeklyBreakdown[wk];
+            w.days.push(day.date);
+            w.dayObjects.push(day);
+            w.cost += day.cost;
+            if (day.isCostReal) w.hasCostReal = true; else w.hasCostProj = true;
+            w.adFee += day.adFee;
+            if (day.isAdReal) w.hasAdReal = true; else w.hasAdProj = true;
+            w.boost += day.boost;
+            if (day.isBoostReal) w.hasBoostReal = true; else w.hasBoostProj = true;
+        });
+        const weeks = Object.values(weeklyBreakdown).sort((a, b) => a.weekKey.localeCompare(b.weekKey));
+
+        const getCustomWeekLabel = (wk, daysList) => {
+            const parts = wk.split('-W');
+            const weekNum = parseInt(parts[1], 10);
+            const sortedDays = [...daysList].sort();
+            const firstDateStr = sortedDays[0];
+            const lastDateStr = sortedDays[sortedDays.length - 1];
+            
+            const firstParts = firstDateStr.split('-');
+            const lastParts = lastDateStr.split('-');
+            
+            const firstYear = parseInt(firstParts[0], 10);
+            const firstMonth = parseInt(firstParts[1], 10);
+            const firstDay = parseInt(firstParts[2], 10);
+            
+            const lastMonth = parseInt(lastParts[1], 10);
+            const lastDay = parseInt(lastParts[2], 10);
+            
+            if (firstMonth === lastMonth) {
+                return firstYear + '年' + firstMonth + '月' + firstDay + '日 - ' + lastDay + '日 (第' + weekNum + '周)';
+            } else {
+                return firstYear + '年' + firstMonth + '月' + firstDay + '日 - ' + lastMonth + '月' + lastDay + '日 (第' + weekNum + '周)';
+            }
+        };
+
+        const getDayLabel = (dateStr) => {
+            const parts = dateStr.split('-');
+            const dt = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+            const dayNames = ['日', '一', '二', '三', '四', '五', '六'];
+            return Number(parts[1]) + '/' + Number(parts[2]) + ' 周' + dayNames[dt.getDay()];
+        };
+
+        let html = `
+            <div class="p-6">
+                <div class="flex justify-between items-center border-b border-torn-border pb-3 mb-4">
+                    <h3 class="text-lg font-bold text-white flex items-center">
+                        <i class="fas fa-coins text-red-400 mr-2"></i>月度总支出估算明细
+                    </h3>
+                    <button class="text-gray-400 hover:text-white" onclick="Utils.hideModal()">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                
+                <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+                    <div class="bg-torn-surface border border-torn-border rounded p-2 text-center">
+                        <div class="text-gray-400 text-xs mb-0.5">商品成本</div>
+                        <div class="font-mono text-white text-sm font-bold">${Utils.formatMoney(monthFin.cost)}</div>
+                    </div>
+                    <div class="bg-torn-surface border border-torn-border rounded p-2 text-center">
+                        <div class="text-gray-400 text-xs mb-0.5">广告费用</div>
+                        <div class="font-mono text-white text-sm font-bold">${Utils.formatMoney(monthFin.adFee)}</div>
+                    </div>
+                    <div class="bg-torn-surface border border-torn-border rounded p-2 text-center">
+                        <div class="text-gray-400 text-xs mb-0.5">Boost 支出</div>
+                        <div class="font-mono text-white text-sm font-bold">${Utils.formatMoney(monthBoost)}</div>
+                    </div>
+                    <div class="bg-red-950/40 border border-red-500/30 rounded p-2 text-center">
+                        <div class="text-red-300 text-xs mb-0.5">总支出预估</div>
+                        <div class="font-mono text-red-400 text-sm font-bold">${Utils.formatMoney(monthTotalExpense)}</div>
+                    </div>
+                </div>
+ 
+                <h4 class="text-sm font-bold text-gray-300 mb-2">每周支出预测与实际明细 <span class="text-xs text-gray-500 font-normal ml-1">点击展开每日明细</span></h4>
+                <div class="overflow-y-auto max-h-[400px] border border-torn-border rounded mb-6">
+                    <table class="min-w-full text-xs text-left text-gray-300" id="expense-weekly-table">
+                        <thead class="bg-torn-surface text-gray-400 sticky top-0">
+                            <tr>
+                                <th class="p-2 border-b border-torn-border" style="width:24px"></th>
+                                <th class="p-2 border-b border-torn-border">周度范围</th>
+                                <th class="p-2 border-b border-torn-border">商品成本</th>
+                                <th class="p-2 border-b border-torn-border">广告费</th>
+                                <th class="p-2 border-b border-torn-border">Boost 支出</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${weeks.map((w, wIdx) => {
+                                const costLabel = w.hasCostReal && !w.hasCostProj ? '实' : (!w.hasCostReal && w.hasCostProj ? '预' : '实/预');
+                                const costColor = costLabel === '实' ? 'text-torn-green' : (costLabel === '预' ? 'text-gray-500' : 'text-torn-gold');
+                                
+                                const adLabel = w.hasAdReal && !w.hasAdProj ? '实' : (!w.hasAdReal && w.hasAdProj ? '预' : '实/预');
+                                const adColor = adLabel === '实' ? 'text-torn-green' : (adLabel === '预' ? 'text-gray-500' : 'text-torn-gold');
+                                
+                                const boostLabel = w.hasBoostReal && !w.hasBoostProj ? '实' : (!w.hasBoostReal && w.hasBoostProj ? '预' : '实/预');
+                                const boostColor = boostLabel === '实' ? 'text-torn-green' : (boostLabel === '预' ? 'text-gray-500' : 'text-torn-gold');
+
+                                let rowsHtml = `
+                                    <tr class="week-expand-row hover:bg-torn-surface/50 border-b border-torn-border/50 cursor-pointer" data-week-idx="${wIdx}">
+                                        <td class="p-2 text-center"><i class="fas fa-chevron-right week-expand-icon text-gray-500 transition-transform duration-200" style="font-size:10px"></i></td>
+                                        <td class="p-2 font-mono font-semibold">${getCustomWeekLabel(w.weekKey, w.days)}</td>
+                                        <td class="p-2 font-mono">${Utils.formatMoney(w.cost)} <span class="text-xs ${costColor}">(${costLabel})</span></td>
+                                        <td class="p-2 font-mono">${Utils.formatMoney(w.adFee)} <span class="text-xs ${adColor}">(${adLabel})</span></td>
+                                        <td class="p-2 font-mono">${w.boost > 0 ? Utils.formatMoney(w.boost) : '-'} <span class="text-xs ${boostColor}">(${boostLabel})</span></td>
+                                    </tr>
+                                `;
+
+                                const sortedDays = [...w.dayObjects].sort((a, b) => a.date.localeCompare(b.date));
+                                sortedDays.forEach(day => {
+                                    const dayCostTag = day.isCostReal ? '<span class="text-torn-green">(实)</span>' : '<span class="text-gray-500">(预)</span>';
+                                    const dayAdTag = day.isAdReal ? '<span class="text-torn-green">(实)</span>' : '<span class="text-gray-500">(预)</span>';
+                                    const dayBoostTag = day.isBoostReal ? '<span class="text-torn-green">(实)</span>' : '<span class="text-gray-500">(预)</span>';
+                                    const todayStr = Utils.todayKey();
+                                    const isToday = day.date === todayStr;
+                                    const todayClass = isToday ? 'bg-torn-accent/10' : 'bg-torn-bg/60';
+                                    rowsHtml += `
+                                        <tr class="week-day-row border-b border-torn-border/30 ${todayClass}" data-parent-week="${wIdx}" style="display:none">
+                                            <td class="p-1.5"></td>
+                                            <td class="p-1.5 pl-6 font-mono text-gray-400">
+                                                ${isToday ? '<span class="inline-block w-1.5 h-1.5 rounded-full bg-torn-accent mr-1"></span>' : '<span class="inline-block w-1.5 h-1.5 mr-1"></span>'}
+                                                ${getDayLabel(day.date)}
+                                            </td>
+                                            <td class="p-1.5 font-mono text-gray-400">${day.cost > 0 ? Utils.formatMoney(day.cost) : '-'} ${day.cost > 0 ? dayCostTag : ''}</td>
+                                            <td class="p-1.5 font-mono text-gray-400">${day.adFee > 0 ? Utils.formatMoney(day.adFee) : '-'} ${day.adFee > 0 ? dayAdTag : ''}</td>
+                                            <td class="p-1.5 font-mono text-gray-400">${day.boost > 0 ? Utils.formatMoney(day.boost) : '-'} ${day.boost > 0 ? dayBoostTag : ''}</td>
+                                        </tr>
+                                    `;
+                                });
+
+                                return rowsHtml;
+                            }).join('')}
+                        </tbody>
+                    </table>
+                </div>
+ 
+                <h4 class="text-sm font-bold text-gray-300 mb-2">当月 Boost 购买实际记录</h4>
+                <div class="overflow-y-auto max-h-[200px] border border-torn-border rounded">
+                    <table class="min-w-full text-xs text-left text-gray-300">
+                        <thead class="bg-torn-surface text-gray-400 sticky top-0">
+                            <tr>
+                                <th class="p-2 border-b border-torn-border">日期</th>
+                                <th class="p-2 border-b border-torn-border">卖家</th>
+                                <th class="p-2 border-b border-torn-border">金额</th>
+                                <th class="p-2 border-b border-torn-border">备注</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${boostTxs.length === 0 ? `
+                                <tr>
+                                    <td colspan="4" class="p-4 text-center text-gray-500">当月无 Boost 实际购买记录</td>
+                                </tr>
+                            ` : boostTxs.map(tx => `
+                                <tr class="hover:bg-torn-surface/50 border-b border-torn-border/50">
+                                    <td class="p-2 font-mono">${tx.date || '-'}</td>
+                                    <td class="p-2">${tx.player_name || `ID:${tx.player_id}`}</td>
+                                    <td class="p-2 font-mono text-red-400">${Utils.formatMoney(tx.amount)}</td>
+                                    <td class="p-2 text-gray-400 max-w-[200px] truncate" title="${tx.note || ''}">${tx.note || '-'}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        `;
+        Utils.showModal(html, 'max-w-3xl');
+
+        // Bind expand/collapse events for weekly rows
+        const table = document.getElementById('expense-weekly-table');
+        if (table) {
+            table.querySelectorAll('.week-expand-row').forEach(row => {
+                row.addEventListener('click', () => {
+                    const wIdx = row.dataset.weekIdx;
+                    const icon = row.querySelector('.week-expand-icon');
+                    const dayRows = table.querySelectorAll(`.week-day-row[data-parent-week="${wIdx}"]`);
+                    const isExpanded = icon.classList.contains('fa-chevron-down');
+                    if (isExpanded) {
+                        icon.classList.remove('fa-chevron-down');
+                        icon.classList.add('fa-chevron-right');
+                        dayRows.forEach(r => r.style.display = 'none');
+                    } else {
+                        icon.classList.remove('fa-chevron-right');
+                        icon.classList.add('fa-chevron-down');
+                        dayRows.forEach(r => r.style.display = '');
+                    }
+                });
+            });
+        }
+    },
+
+    async _showMonthIncomeDetails() {
+        const monthParts = this.selectedMonthKey.split('-');
+        const monthYear = parseInt(monthParts[0], 10);
+        const monthVal = parseInt(monthParts[1], 10);
+        const startOfMonth = new Date(monthYear, monthVal - 1, 1);
+        const endOfMonth = new Date(monthYear, monthVal, 0);
+        const todayStr = Utils.todayKey();
+        const currentWeekKey = Utils.weekKey(new Date(todayStr + 'T00:00:00'));
+
+        const monthFin = this._calculateRangeFinancials(startOfMonth, endOfMonth);
+        const monthTax = monthFin.tax;
+        const monthCarryover = monthFin.carryover;
+        const monthTrain = monthFin.train;
+        
+        const monthTxs = this.transactions.filter(tx => {
+            let ts = tx.timestamp || 0;
+            if (ts > 0 && ts < 100000000000) ts *= 1000;
+            return ts >= startOfMonth.getTime() && ts <= endOfMonth.getTime() + 86399999;
+        });
+
+        const taxTxs = monthTxs.filter(tx => this._isTaxTx(tx));
+        const trainTxs = monthTxs.filter(tx => tx.category === 'train');
+        const otherTxs = monthTxs.filter(tx => !this._isTaxTx(tx) && tx.category !== 'boost' && tx.category !== 'train');
+
+        let monthOther = 0;
+        otherTxs.forEach(tx => monthOther += tx.amount);
+
+        const monthTotalIncome = monthTax + monthTrain + monthOther + monthFin.income + monthCarryover;
+
+        // Group dailyBreakdown by week keys
+        const weeklyBreakdown = {};
+        monthFin.dailyBreakdown.forEach(day => {
+            const parts = day.date.split('-');
+            const dt = new Date(Date.UTC(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2])));
+            const wk = Utils.weekKey(dt);
+            if (!weeklyBreakdown[wk]) {
+                weeklyBreakdown[wk] = {
+                    weekKey: wk,
+                    income: 0,
+                    hasIncomeProj: false,
+                    hasIncomeReal: false,
+                    tax: 0,
+                    hasTaxProj: false,
+                    hasTaxReal: false,
+                    carryover: 0,
+                    train: 0,
+                    hasTrainProj: false,
+                    hasTrainReal: false,
+                    days: [],
+                    dayObjects: []
+                };
+            }
+            const w = weeklyBreakdown[wk];
+            w.days.push(day.date);
+            w.dayObjects.push(day);
+            w.income += day.income;
+            if (day.isIncomeReal) w.hasIncomeReal = true; else w.hasIncomeProj = true;
+            w.tax += day.tax;
+            if (day.isTaxReal) w.hasTaxReal = true;
+            if (day.isTaxProj) w.hasTaxProj = true;
+            w.carryover += day.carryover || 0;
+            w.train += day.train;
+            if (day.isTrainReal) w.hasTrainReal = true; else w.hasTrainProj = true;
+        });
+        const weeks = Object.values(weeklyBreakdown).sort((a, b) => a.weekKey.localeCompare(b.weekKey));
+
+        const getCustomWeekLabel = (wk, daysList) => {
+            const parts = wk.split('-W');
+            const weekNum = parseInt(parts[1], 10);
+            const sortedDays = [...daysList].sort();
+            const firstDateStr = sortedDays[0];
+            const lastDateStr = sortedDays[sortedDays.length - 1];
+            
+            const firstParts = firstDateStr.split('-');
+            const lastParts = lastDateStr.split('-');
+            
+            const firstYear = parseInt(firstParts[0], 10);
+            const firstMonth = parseInt(firstParts[1], 10);
+            const firstDay = parseInt(firstParts[2], 10);
+            
+            const lastMonth = parseInt(lastParts[1], 10);
+            const lastDay = parseInt(lastParts[2], 10);
+            
+            if (firstMonth === lastMonth) {
+                return firstYear + '年' + firstMonth + '月' + firstDay + '日 - ' + lastDay + '日 (第' + weekNum + '周)';
+            } else {
+                return firstYear + '年' + firstMonth + '月' + firstDay + '日 - ' + lastMonth + '月' + lastDay + '日 (第' + weekNum + '周)';
+            }
+        };
+
+        const getDayLabel = (dateStr) => {
+            const parts = dateStr.split('-');
+            const dt = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+            const dayNames = ['日', '一', '二', '三', '四', '五', '六'];
+            return Number(parts[1]) + '/' + Number(parts[2]) + ' 周' + dayNames[dt.getDay()];
+        };
+
+        let html = `
+            <div class="p-6">
+                <div class="flex justify-between items-center border-b border-torn-border pb-3 mb-4">
+                    <h3 class="text-lg font-bold text-white flex items-center">
+                        <i class="fas fa-coins text-torn-green mr-2"></i>月度总收入估算明细
+                    </h3>
+                    <button class="text-gray-400 hover:text-white" onclick="Utils.hideModal()">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                
+                <div class="grid grid-cols-2 sm:grid-cols-6 gap-2 mb-6">
+                    <div class="bg-torn-surface border border-torn-border rounded p-2 text-center">
+                        <div class="text-gray-400 text-xs mb-0.5">营业额收入</div>
+                        <div class="font-mono text-white text-xs font-bold">${Utils.formatMoney(monthFin.income)}</div>
+                    </div>
+                    <div class="bg-torn-surface border border-torn-border rounded p-2 text-center">
+                        <div class="text-gray-400 text-xs mb-0.5">员工税收</div>
+                        <div class="font-mono text-white text-xs font-bold">${Utils.formatMoney(monthTax)}</div>
+                    </div>
+                    <div class="bg-torn-surface border border-torn-border rounded p-2 text-center">
+                        <div class="text-gray-400 text-xs mb-0.5">结转项</div>
+                        <div class="font-mono text-white text-xs font-bold">${Utils.formatMoney(monthCarryover)}</div>
+                    </div>
+                    <div class="bg-torn-surface border border-torn-border rounded p-2 text-center">
+                        <div class="text-gray-400 text-xs mb-0.5">训练费用</div>
+                        <div class="font-mono text-white text-xs font-bold">${Utils.formatMoney(monthTrain)}</div>
+                    </div>
+                    <div class="bg-torn-surface border border-torn-border rounded p-2 text-center">
+                        <div class="text-gray-400 text-xs mb-0.5">其他收入</div>
+                        <div class="font-mono text-white text-xs font-bold">${Utils.formatMoney(monthOther)}</div>
+                    </div>
+                    <div class="bg-green-950/40 border border-green-500/30 rounded p-2 text-center col-span-2 sm:col-span-1">
+                        <div class="text-green-300 text-xs mb-0.5">总收入预估</div>
+                        <div class="font-mono text-torn-green text-xs font-bold">${Utils.formatMoney(monthTotalIncome)}</div>
+                    </div>
+                </div>
+ 
+                <h4 class="text-sm font-bold text-gray-300 mb-2">每周预测与实际收入明细 <span class="text-xs text-gray-500 font-normal ml-1">点击展开每日明细</span></h4>
+                <div class="overflow-y-auto max-h-[400px] border border-torn-border rounded mb-6">
+                    <table class="min-w-full text-xs text-left text-gray-300" id="income-weekly-table">
+                        <thead class="bg-torn-surface text-gray-400 sticky top-0">
+                            <tr>
+                                <th class="p-2 border-b border-torn-border" style="width:24px"></th>
+                                <th class="p-2 border-b border-torn-border">周度范围</th>
+                                <th class="p-2 border-b border-torn-border">公司营业额</th>
+                                <th class="p-2 border-b border-torn-border">员工税收</th>
+                                <th class="p-2 border-b border-torn-border">结转项</th>
+                                <th class="p-2 border-b border-torn-border">训练费</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${weeks.map((w, wIdx) => {
+                                const incomeLabel = w.hasIncomeReal && !w.hasIncomeProj ? '实' : (!w.hasIncomeReal && w.hasIncomeProj ? '预' : '实/预');
+                                const incomeColor = incomeLabel === '实' ? 'text-torn-green' : (incomeLabel === '预' ? 'text-gray-500' : 'text-torn-gold');
+                                
+                                const taxLabel = w.tax === 0 ? (w.weekKey >= currentWeekKey ? '预' : '实') : (w.hasTaxReal && !w.hasTaxProj ? '实' : (!w.hasTaxReal && w.hasTaxProj ? '预' : '实/预'));
+                                const taxColor = taxLabel === '实' ? 'text-torn-green' : (taxLabel === '预' ? 'text-gray-500' : 'text-torn-gold');
+                                
+                                const trainLabel = w.hasTrainReal && !w.hasTrainProj ? '实' : (!w.hasTrainReal && w.hasTrainProj ? '预' : '实/预');
+                                const trainColor = trainLabel === '实' ? 'text-torn-green' : (trainLabel === '预' ? 'text-gray-500' : 'text-torn-gold');
+
+                                let rowsHtml = `
+                                    <tr class="week-expand-row hover:bg-torn-surface/50 border-b border-torn-border/50 cursor-pointer" data-week-idx="${wIdx}">
+                                        <td class="p-2 text-center"><i class="fas fa-chevron-right week-expand-icon text-gray-500 transition-transform duration-200" style="font-size:10px"></i></td>
+                                        <td class="p-2 font-mono font-semibold">${getCustomWeekLabel(w.weekKey, w.days)}</td>
+                                        <td class="p-2 font-mono">${Utils.formatMoney(w.income)} <span class="text-xs ${incomeColor}">(${incomeLabel})</span></td>
+                                        <td class="p-2 font-mono">${Utils.formatMoney(w.tax)} <span class="text-xs ${taxColor}">(${taxLabel})</span></td>
+                                        <td class="p-2 font-mono">${w.carryover > 0 ? Utils.formatMoney(w.carryover) : '-'}</td>
+                                        <td class="p-2 font-mono">${Utils.formatMoney(w.train)} <span class="text-xs ${trainColor}">(${trainLabel})</span></td>
+                                    </tr>
+                                `;
+
+                                const sortedDays = [...w.dayObjects].sort((a, b) => a.date.localeCompare(b.date));
+                                sortedDays.forEach(day => {
+                                    const dayIncomeTag = day.isIncomeReal ? '<span class="text-torn-green">(实)</span>' : '<span class="text-gray-500">(预)</span>';
+                                    const dayTaxTag = day.isTaxReal && day.isTaxProj ? '<span class="text-torn-gold">(实/预)</span>' : (day.isTaxReal ? '<span class="text-torn-green">(实)</span>' : '<span class="text-gray-500">(预)</span>');
+                                    const dayTrainTag = day.isTrainReal ? '<span class="text-torn-green">(实)</span>' : '<span class="text-gray-500">(预)</span>';
+                                    const todayStr = Utils.todayKey();
+                                    const isToday = day.date === todayStr;
+                                    const todayClass = isToday ? 'bg-torn-accent/10' : 'bg-torn-bg/60';
+                                    rowsHtml += `
+                                        <tr class="week-day-row border-b border-torn-border/30 ${todayClass}" data-parent-week="${wIdx}" style="display:none">
+                                            <td class="p-1.5"></td>
+                                            <td class="p-1.5 pl-6 font-mono text-gray-400">
+                                                ${isToday ? '<span class="inline-block w-1.5 h-1.5 rounded-full bg-torn-accent mr-1"></span>' : '<span class="inline-block w-1.5 h-1.5 mr-1"></span>'}
+                                                ${getDayLabel(day.date)}
+                                            </td>
+                                            <td class="p-1.5 font-mono text-gray-400">${day.income > 0 ? Utils.formatMoney(day.income) : '-'} ${day.income > 0 ? dayIncomeTag : ''}</td>
+                                            <td class="p-1.5 font-mono text-gray-400">${day.tax > 0 ? Utils.formatMoney(day.tax) : '-'} ${day.tax > 0 ? dayTaxTag : ''}</td>
+                                            <td class="p-1.5 font-mono text-gray-400">${day.carryover > 0 ? Utils.formatMoney(day.carryover) : '-'}</td>
+                                            <td class="p-1.5 font-mono text-gray-400">${day.train > 0 ? Utils.formatMoney(day.train) : '-'} ${day.train > 0 ? dayTrainTag : ''}</td>
+                                        </tr>
+                                    `;
+                                });
+
+                                return rowsHtml;
+                            }).join('')}
+                        </tbody>
+                    </table>
+                </div>
+
+                <h4 class="text-sm font-bold text-gray-300 mb-2">当月实际交易流水 (税收/训练/其他)</h4>
+                <div class="overflow-y-auto max-h-[250px] border border-torn-border rounded">
+                    <table class="min-w-full text-xs text-left text-gray-300">
+                        <thead class="bg-torn-surface text-gray-400 sticky top-0">
+                            <tr>
+                                <th class="p-2 border-b border-torn-border">日期</th>
+                                <th class="p-2 border-b border-torn-border">员工</th>
+                                <th class="p-2 border-b border-torn-border">分类</th>
+                                <th class="p-2 border-b border-torn-border">金额</th>
+                                <th class="p-2 border-b border-torn-border">备注</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${(taxTxs.length + trainTxs.length + otherTxs.length) === 0 ? `
+                                <tr>
+                                    <td colspan="5" class="p-4 text-center text-gray-500">当月无实际交易流水记录</td>
+                                </tr>
+                            ` : [...taxTxs, ...trainTxs, ...otherTxs].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)).map(tx => {
+                                let catLabel = '其他';
+                                let catColor = 'text-gray-300';
+                                if (this._isTaxTx(tx)) { catLabel = '税收'; catColor = 'text-torn-gold'; }
+                                else if (tx.category === 'train') { catLabel = '训练'; catColor = 'text-cyan-400'; }
+
+                                return `
+                                <tr class="hover:bg-torn-surface/50 border-b border-torn-border/50">
+                                    <td class="p-2 font-mono">${tx.date || '-'}</td>
+                                    <td class="p-2">${tx.player_name || `ID:${tx.player_id}`}</td>
+                                    <td class="p-2 ${catColor}">${catLabel}</td>
+                                    <td class="p-2 font-mono text-torn-green">${Utils.formatMoney(tx.amount)}</td>
+                                    <td class="p-2 text-gray-400 max-w-[200px] truncate" title="${tx.note || '-'}">${tx.note || '-'}</td>
+                                </tr>
+                                `;
+                            }).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        `;
+        Utils.showModal(html, 'max-w-3xl');
+
+        // Bind expand/collapse events for weekly rows
+        const incomeTable = document.getElementById('income-weekly-table');
+        if (incomeTable) {
+            incomeTable.querySelectorAll('.week-expand-row').forEach(row => {
+                row.addEventListener('click', () => {
+                    const wIdx = row.dataset.weekIdx;
+                    const icon = row.querySelector('.week-expand-icon');
+                    const dayRows = incomeTable.querySelectorAll(`.week-day-row[data-parent-week="${wIdx}"]`);
+                    const isExpanded = icon.classList.contains('fa-chevron-down');
+                    if (isExpanded) {
+                        icon.classList.remove('fa-chevron-down');
+                        icon.classList.add('fa-chevron-right');
+                        icon.style.transform = '';
+                        dayRows.forEach(r => r.style.display = 'none');
+                    } else {
+                        icon.classList.remove('fa-chevron-right');
+                        icon.classList.add('fa-chevron-down');
+                        dayRows.forEach(r => r.style.display = '');
+                    }
+                });
+            });
+        }
     },
 
     // ---- Tab: 交易记录 ----
 
     _transactionsTabHTML() {
-        const empOptions = this.employees.map(e => `<option value="${e.player_id}" ${this.txFilterEmp === String(e.player_id) ? 'selected' : ''}>${e.name}</option>`).join('');
+        const sortedEmployeesForTx = [...this.employees].sort((a, b) => {
+            if (a.left_date && !b.left_date) return 1;
+            if (!a.left_date && b.left_date) return -1;
+            return a.name.localeCompare(b.name);
+        });
+        const empOptions = sortedEmployeesForTx.map(e => {
+            const nameLabel = e.left_date ? `${e.name}（已离职）` : e.name;
+            return `<option value="${e.player_id}" ${this.txFilterEmp === String(e.player_id) ? 'selected' : ''}>${nameLabel}</option>`;
+        }).join('');
 
         const headers = [
             { key: 'select', label: '<input type="checkbox" id="tx-select-all" class="cursor-pointer" />', sortable: false },
@@ -1148,7 +2204,7 @@ window.FinancePage = {
                 select: `<input type="checkbox" class="tx-row-cb cursor-pointer" data-tx-id="${tx.id}" />`,
                 id: tx.id,
                 date: tx.date || '-',
-                employee: tx.player_name || '-',
+                employee: tx.player_id ? `<a href="https://www.torn.com/profiles.php?XID=${tx.player_id}" target="_blank" class="text-torn-accent hover:underline">${tx.player_name || '-'}</a>` : (tx.player_name || '-'),
                 amount: Utils.formatTransactionAmount(tx),
                 category: catSelect,
                 note: tx.note
@@ -1333,49 +2389,71 @@ window.FinancePage = {
 
     // ---- Week Selector UI ----
 
+    // ---- Week Selector UI ----
+
     _weekSelectorHTML: function() {
-        var isCurrentWeek = this.selectedWeekKey === Utils.weekKey();
-        var weekLabelText = Utils.weekLabel(this.selectedWeekKey);
+        var currentWeek = Utils.weekKey();
         var self = this;
 
-        // 查找当前周的记录以确定状态
-        var weekRecord = self.taxWeeks.find(function(w) { return w.week_key === self.selectedWeekKey; });
+        // 获取连续的所有周 keys
+        var allKeys = this._getContinuousWeekKeys();
+        var isCurrentWeekSelected = this.selectedWeekKey === currentWeek;
 
-        var statusDotColor = 'text-gray-400';
-        var statusText = '无数据';
-        if (weekRecord) {
-            switch (self._computeWeekTaxStatusFromEmployees(self.selectedWeekKey)) {
-                case 'paid':
-                    statusDotColor = 'text-green-400';
-                    statusText = '已缴清';
-                    break;
-                case 'overdue':
-                    statusDotColor = 'text-red-400';
-                    statusText = '未缴清';
-                    break;
-                case 'current':
-                    statusDotColor = 'text-yellow-400';
-                    statusText = '进行中';
-                    break;
-                default:
-                    statusDotColor = 'text-gray-400';
-                    statusText = '无数据';
-                    break;
+        var html = '<div class="fin-week-selector flex items-center justify-between gap-3 mb-4 p-3 bg-torn-card rounded-lg">';
+        
+        // 向左滚动按钮
+        html += '<button class="week-nav-btn px-3 py-1.5 bg-torn-bg hover:bg-torn-accent hover:text-white rounded transition-colors text-lg font-bold" data-action="scroll-left" title="向左滚动">«</button>';
+        
+        // 并排显示的周 Tab 列表（渲染所有周，由 Flexbox/CSS 决定溢出）
+        html += '<div class="fin-week-tabs-list flex items-center gap-2 overflow-x-auto flex-1 py-1" id="week-tabs-list">';
+        allKeys.forEach(function(wk) {
+            var parts = wk.split('-W');
+            var weekNum = parts[1];
+            var year = parts[0];
+            var currentYear = String(new Date().getFullYear());
+            var weekLabel = 'W' + weekNum;
+            if (year !== currentYear) {
+                weekLabel = year.slice(2) + '-W' + weekNum;
             }
-        }
 
-        var nextDisabledClass = isCurrentWeek ? 'opacity-50 cursor-not-allowed' : '';
-        var nextDisabledAttr = isCurrentWeek ? ' disabled' : '';
+            var range = Utils.weekDateRange(wk);
+            var startStr = String(range.start.getMonth() + 1).padStart(2, '0') + '/' + String(range.start.getDate()).padStart(2, '0');
+            var endStr = String(range.end.getMonth() + 1).padStart(2, '0') + '/' + String(range.end.getDate()).padStart(2, '0');
+            var dateRange = startStr + ' - ' + endStr;
 
-        var html = '<div class="week-selector flex items-center justify-center gap-3 mb-4 p-4 bg-torn-card rounded-lg">';
-        html += '<button class="week-nav-btn px-6 py-4 bg-torn-bg hover:bg-torn-accent hover:text-white rounded transition-colors text-2xl font-bold min-w-[52px]" data-action="prev-week" title="上一周">«</button>';
-        html += '<div class="week-label flex flex-col items-center min-w-[300px]">';
-        html += '<span class="text-base font-semibold text-torn-accent" id="week-label-text">' + weekLabelText + '</span>';
-        html += '<span class="text-xs mt-1 ' + statusDotColor + '" id="week-status-text">● ' + statusText + '</span>';
+            var status = self._computeWeekTaxStatusFromEmployees(wk);
+            var statusText = '进行中';
+            var dotClass = 'current';
+            if (status === 'paid') {
+                statusText = '已缴清';
+                dotClass = 'paid';
+            } else if (status === 'overdue') {
+                statusText = '未结清';
+                dotClass = 'overdue';
+            }
+
+            var isSelected = wk === self.selectedWeekKey;
+            var tabClasses = ['fin-week-tab'];
+            if (isSelected) tabClasses.push('active');
+            if (status === 'overdue') tabClasses.push('overdue');
+
+            html += '<div class="' + tabClasses.join(' ') + '" data-week-key="' + wk + '" title="' + Utils.weekLabel(wk) + '">';
+            html += '<span class="text-sm font-bold text-white">' + weekLabel + '</span>';
+            html += '<span class="text-xs text-gray-400 mt-1">' + dateRange + '</span>';
+            html += '<span class="text-xs mt-1 flex items-center gap-1.5 text-gray-300">';
+            html += '<span class="fin-week-status-dot ' + dotClass + '"></span>';
+            html += statusText;
+            html += '</span>';
+            html += '</div>';
+        });
         html += '</div>';
-        html += '<button class="week-nav-btn px-6 py-4 bg-torn-bg hover:bg-torn-accent hover:text-white rounded transition-colors text-2xl font-bold min-w-[52px] ' + nextDisabledClass + '" data-action="next-week"' + nextDisabledAttr + ' title="下一周">»</button>';
-        if (!isCurrentWeek) {
-            html += '<button class="week-today-btn px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm transition-colors" data-action="goto-today">回到本周</button>';
+
+        // 向右滚动按钮
+        html += '<button class="week-nav-btn px-3 py-1.5 bg-torn-bg hover:bg-torn-accent hover:text-white rounded transition-colors text-lg font-bold" data-action="scroll-right" title="向右滚动">»</button>';
+        
+        // 回到本周按钮
+        if (!isCurrentWeekSelected) {
+            html += '<button class="week-today-btn px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs transition-colors whitespace-nowrap" data-action="goto-today">回到本周</button>';
         }
         html += '</div>';
 
@@ -1385,7 +2463,7 @@ window.FinancePage = {
     _bindWeekSelectorEvents: function() {
         var self = this;
 
-        // 清理旧事件监听器（防止 render 多次调用造成事件堆积 / 双击跳两周）
+        // 清理旧事件监听器
         if (self._weekNavPrevHandler) {
             var oldPrevBtn = document.querySelector('[data-action="prev-week"]');
             if (oldPrevBtn) oldPrevBtn.removeEventListener('click', self._weekNavPrevHandler);
@@ -1394,39 +2472,45 @@ window.FinancePage = {
             var oldNextBtn = document.querySelector('[data-action="next-week"]');
             if (oldNextBtn) oldNextBtn.removeEventListener('click', self._weekNavNextHandler);
         }
+        if (self._scrollLeftHandler) {
+            var oldLeftBtn = document.querySelector('[data-action="scroll-left"]');
+            if (oldLeftBtn) oldLeftBtn.removeEventListener('click', self._scrollLeftHandler);
+        }
+        if (self._scrollRightHandler) {
+            var oldRightBtn = document.querySelector('[data-action="scroll-right"]');
+            if (oldRightBtn) oldRightBtn.removeEventListener('click', self._scrollRightHandler);
+        }
         if (self._weekNavTodayHandler) {
             var oldTodayBtn = document.querySelector('[data-action="goto-today"]');
             if (oldTodayBtn) oldTodayBtn.removeEventListener('click', self._weekNavTodayHandler);
         }
-
-        // 上一周按钮：用 range.start - 1天 精确跳到上一周
-        var prevBtn = document.querySelector('[data-action="prev-week"]');
-        if (prevBtn) {
-            self._weekNavPrevHandler = async function() {
-                var range = Utils.weekDateRange(self.selectedWeekKey);
-                // 前一天必然属于上一周（比 range.start - 7天 更稳健，避免跨年/闰秒边界跳两周）
-                var prevDay = new Date(range.start.getTime() - 24 * 60 * 60 * 1000);
-                var prevWeekKey = Utils.weekKey(prevDay);
-                await self._navigateToWeek(prevWeekKey);
-            };
-            prevBtn.addEventListener('click', self._weekNavPrevHandler);
+        if (self._weekTabClickHandler) {
+            var oldTabsContainer = document.getElementById('week-tabs-list');
+            if (oldTabsContainer) oldTabsContainer.removeEventListener('click', self._weekTabClickHandler);
         }
 
-        // 下一周按钮：用 range.end + 1天 精确跳到下一周
-        var nextBtn = document.querySelector('[data-action="next-week"]');
-        if (nextBtn) {
-            self._weekNavNextHandler = async function() {
-                var range = Utils.weekDateRange(self.selectedWeekKey);
-                // 后一天必然属于下一周
-                var nextDay = new Date(range.end.getTime() + 24 * 60 * 60 * 1000);
-                var nextWeekKey = Utils.weekKey(nextDay);
-                // 不能超过当前周
-                var currentWeek = Utils.weekKey();
-                if (nextWeekKey <= currentWeek) {
-                    await self._navigateToWeek(nextWeekKey);
+        // 向左滚动按钮
+        var leftBtn = document.querySelector('[data-action="scroll-left"]');
+        if (leftBtn) {
+            self._scrollLeftHandler = function() {
+                var tabsContainer = document.getElementById('week-tabs-list');
+                if (tabsContainer) {
+                    tabsContainer.scrollBy({ left: -300, behavior: 'smooth' });
                 }
             };
-            nextBtn.addEventListener('click', self._weekNavNextHandler);
+            leftBtn.addEventListener('click', self._scrollLeftHandler);
+        }
+
+        // 向右滚动按钮
+        var rightBtn = document.querySelector('[data-action="scroll-right"]');
+        if (rightBtn) {
+            self._scrollRightHandler = function() {
+                var tabsContainer = document.getElementById('week-tabs-list');
+                if (tabsContainer) {
+                    tabsContainer.scrollBy({ left: 300, behavior: 'smooth' });
+                }
+            };
+            rightBtn.addEventListener('click', self._scrollRightHandler);
         }
 
         // 回到本周按钮
@@ -1436,6 +2520,61 @@ window.FinancePage = {
                 await self._navigateToWeek(Utils.weekKey());
             };
             todayBtn.addEventListener('click', self._weekNavTodayHandler);
+        }
+
+        // 周 Tab 点击切换
+        var tabsContainer = document.getElementById('week-tabs-list');
+        if (tabsContainer) {
+            self._weekTabClickHandler = async function(e) {
+                var tab = e.target.closest('.fin-week-tab');
+                if (tab) {
+                    var wk = tab.dataset.weekKey;
+                    if (wk && wk !== self.selectedWeekKey) {
+                        await self._navigateToWeek(wk);
+                    }
+                }
+            };
+            tabsContainer.addEventListener('click', self._weekTabClickHandler);
+
+            // 自动将选中的周 Tab 滚动到可视区域中央
+            setTimeout(function() {
+                var activeTab = tabsContainer.querySelector('.fin-week-tab.active');
+                if (activeTab) {
+                    activeTab.scrollIntoView({ behavior: 'auto', block: 'nearest', inline: 'center' });
+                }
+            }, 10);
+        }
+    },
+
+    _getCurrentMonthKey() {
+        const now = new Date();
+        return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    },
+
+    _prevMonth() {
+        const parts = this.selectedMonthKey.split('-');
+        let year = parseInt(parts[0], 10);
+        let month = parseInt(parts[1], 10);
+        month--;
+        if (month < 1) {
+            month = 12;
+            year--;
+        }
+        this.selectedMonthKey = `${year}-${String(month).padStart(2, '0')}`;
+    },
+
+    _nextMonth() {
+        const parts = this.selectedMonthKey.split('-');
+        let year = parseInt(parts[0], 10);
+        let month = parseInt(parts[1], 10);
+        month++;
+        if (month > 12) {
+            month = 1;
+            year++;
+        }
+        const nextKey = `${year}-${String(month).padStart(2, '0')}`;
+        if (nextKey <= this._getCurrentMonthKey()) {
+            this.selectedMonthKey = nextKey;
         }
     },
 
@@ -1582,6 +2721,7 @@ window.FinancePage = {
                     if (records.length > 0) {
                         record = records[0];
                         record.tax_amount = newVal;
+                        record.is_manual_tax = true;
                         record.calculated_at = Date.now();
                         await DB.put('employee_tax', record);
                     } else {
@@ -1594,6 +2734,7 @@ window.FinancePage = {
                             paid_amount: 0,
                             is_written_off: false,
                             written_off_at: null,
+                            is_manual_tax: true,
                             calculated_at: Date.now()
                         };
                         await DB.put('employee_tax', record);
@@ -1648,6 +2789,16 @@ window.FinancePage = {
         const c = document.getElementById('page-content');
         if (!c) return;
 
+        // 窗口尺寸变化事件：动态调整显示的周 Tab 数量
+        if (!this._resizeHandlerBound) {
+            window.addEventListener('resize', Utils.debounce(() => {
+                if (window.Router && window.Router.currentPage === 'finance' && this.activeTab === 'tax') {
+                    this.render();
+                }
+            }, 150));
+            this._resizeHandlerBound = true;
+        }
+
         // Delegated Change Events
         if (this._changeHandler) c.removeEventListener('change', this._changeHandler);
         this._changeHandler = async (e) => {
@@ -1664,8 +2815,64 @@ window.FinancePage = {
                 const txId = Number(e.target.dataset.txId);
                 const tx = this.transactions.find(t => t.id === txId);
                 if (tx) {
+                    const newCat = e.target.value;
+                    const playerTaxRate = this._getEmployeeTaxRate(tx.player_id);
+
+                    if (newCat === 'tax' && playerTaxRate > 0 && tx.amount > playerTaxRate) {
+                        const originalValue = tx.category;
+
+                        let trainPrice = null;
+                        try {
+                            const priceCfg = await DB.get('training_config', 'train_price');
+                            if (priceCfg && priceCfg.value !== undefined) {
+                                trainPrice = priceCfg.value;
+                            }
+                        } catch (e) {}
+
+                        // Prepare in-memory tx properties
+                        tx.category = 'tax';
+
+                        this._showBulkTaxSplitModal([{ tx, taxAmount: playerTaxRate }], [], trainPrice);
+
+                        // Hook cleanup and listeners
+                        const cleanup = () => {
+                            tx.category = originalValue;
+                            this.render();
+                            removeListeners();
+                        };
+                        const removeListeners = () => {
+                            document.removeEventListener('keydown', handleEsc);
+                            document.getElementById('modal-overlay')?.removeEventListener('click', handleOverlayClick);
+                            confirmBtn?.removeEventListener('click', handleConfirmClick);
+                        };
+                        const handleEsc = (e) => {
+                            if (e.key === 'Escape') cleanup();
+                        };
+                        const handleOverlayClick = (e) => {
+                            if (e.target === e.currentTarget) cleanup();
+                        };
+                        const handleConfirmClick = () => {
+                            removeListeners();
+                        };
+
+                        document.addEventListener('keydown', handleEsc);
+                        document.getElementById('modal-overlay')?.addEventListener('click', handleOverlayClick);
+
+                        const confirmBtn = document.getElementById('split-tax-confirm');
+                        if (confirmBtn) {
+                            confirmBtn.addEventListener('click', handleConfirmClick);
+                        }
+                        const cancelBtn = document.getElementById('split-tax-cancel');
+                        if (cancelBtn) {
+                            cancelBtn.addEventListener('click', () => {
+                                cleanup();
+                            });
+                        }
+                        return;
+                    }
+
                     var oldWeekKey = tx.week_key;
-                    tx.category = e.target.value;
+                    tx.category = newCat;
                     tx.week_key = this._autoMatchWeek(tx);
                     await DB.put('transactions', tx);
                     // 更新为税务分类后触发重算，确保税务管理界面显示最新数据
@@ -1693,6 +2900,24 @@ window.FinancePage = {
             switch (action) {
                 case 'refresh':
                     await this.render();
+                    break;
+                case 'prev-month':
+                    this._prevMonth();
+                    await this.render();
+                    break;
+                case 'next-month':
+                    this._nextMonth();
+                    await this.render();
+                    break;
+                case 'goto-current-month':
+                    this.selectedMonthKey = this._getCurrentMonthKey();
+                    await this.render();
+                    break;
+                case 'view-month-expense':
+                    await this._showMonthExpenseDetails();
+                    break;
+                case 'view-month-income':
+                    await this._showMonthIncomeDetails();
                     break;
                 case 'add-transaction':
                     this._showAddTransactionModal();
@@ -1902,6 +3127,11 @@ window.FinancePage = {
         if (!confirm('确定删除此交易？')) return;
         const tx = this.transactions.find(t => Number(t.id) === Number(txId));
         await DB.delete('transactions', txId);
+        
+        if (tx && tx.week_key && tx.week_key !== '__unassigned__') {
+            await this._cascadeRecalculate(tx.week_key);
+        }
+        
         if (tx?.category === 'boost') {
             await Utils.reconcileBoostSellersFromTransactions();
         }
@@ -1918,13 +3148,23 @@ window.FinancePage = {
         if (!confirm(`确定要删除选中的 ${checkboxes.length} 条记录吗？`)) return;
         
         let hadBoost = false;
+        const affectedWeeks = {};
         for (const cb of checkboxes) {
             const txId = Number(cb.dataset.txId);
             const tx = this.transactions.find(t => Number(t.id) === txId);
             if (tx?.category === 'boost') hadBoost = true;
+            if (tx && tx.week_key && tx.week_key !== '__unassigned__') {
+                affectedWeeks[tx.week_key] = true;
+            }
             await DB.delete('transactions', txId);
         }
         if (hadBoost) await Utils.reconcileBoostSellersFromTransactions();
+        
+        const sortedWeeks = Object.keys(affectedWeeks).sort();
+        if (sortedWeeks.length > 0) {
+            await this._cascadeRecalculate(sortedWeeks[0]);
+        }
+        
         Utils.toast(`已成功删除 ${checkboxes.length} 条记录`, 'success');
         await this.render();
     },
@@ -1960,10 +3200,9 @@ window.FinancePage = {
 
         document.getElementById('bulk-edit-save')?.addEventListener('click', async () => {
             const newCat = document.getElementById('bulk-edit-cat')?.value || 'other';
-            const taxAmount = this.config.weekly_tax_amount || 0;
 
-            // When targeting 'tax' with a configured tax amount, detect over-amount items
-            if (newCat === 'tax' && taxAmount > 0) {
+            // When targeting 'tax', detect over-amount items based on employee-specific tax rates
+            if (newCat === 'tax') {
                 const allSelected = [];
                 for (const cb of checkboxes) {
                     const txId = Number(cb.dataset.txId);
@@ -1971,12 +3210,28 @@ window.FinancePage = {
                     if (tx) allSelected.push(tx);
                 }
 
-                const overTaxItems = allSelected.filter(tx => tx.amount > taxAmount);
-                const directTaxItems = allSelected.filter(tx => tx.amount <= taxAmount);
+                const overTaxItems = [];
+                const directTaxItems = [];
+
+                for (const tx of allSelected) {
+                    const playerTaxRate = this._getEmployeeTaxRate(tx.player_id);
+                    if (playerTaxRate > 0 && tx.amount > playerTaxRate) {
+                        overTaxItems.push({ tx, taxAmount: playerTaxRate });
+                    } else {
+                        directTaxItems.push(tx);
+                    }
+                }
 
                 if (overTaxItems.length > 0) {
                     Utils.hideModal();
-                    this._showBulkTaxSplitModal(overTaxItems, directTaxItems, taxAmount);
+                    let trainPrice = null;
+                    try {
+                        const priceCfg = await DB.get('training_config', 'train_price');
+                        if (priceCfg && priceCfg.value !== undefined) {
+                            trainPrice = priceCfg.value;
+                        }
+                    } catch (e) {}
+                    this._showBulkTaxSplitModal(overTaxItems, directTaxItems, trainPrice);
                     return;
                 }
             }
@@ -1997,7 +3252,7 @@ window.FinancePage = {
                     updated++;
                 }
             }
-            // 对所有受影响的周进行级联重算
+            // 对所有受影响 of 周进行级联重算
             var bulkSortedWeeks = Object.keys(bulkAffectedWeeks).sort();
             if (bulkSortedWeeks.length > 0) {
                 await this._cascadeRecalculate(bulkSortedWeeks[0]);
@@ -2008,11 +3263,12 @@ window.FinancePage = {
         });
     },
 
-    _showBulkTaxSplitModal(overTaxItems, directTaxItems, taxAmount) {
+    _showBulkTaxSplitModal(overTaxItems, directTaxItems, trainPrice = null) {
         var self = this;
         // Build rows: one per over-tax item
-        const rowHTML = overTaxItems.map(tx => {
+        const rowHTML = overTaxItems.map(({ tx, taxAmount }) => {
             const remaining = tx.amount - taxAmount;
+            const defaultCat = (trainPrice !== null && remaining >= trainPrice) ? 'train' : 'other';
             return `
                 <div class="flex items-center gap-3 p-3 bg-torn-surface border border-torn-border rounded">
                     <input type="checkbox" class="split-tax-cb" data-tx-id="${tx.id}" checked />
@@ -2027,9 +3283,9 @@ window.FinancePage = {
                         剩余: <span class="text-torn-green font-mono">${Utils.formatMoney(remaining)}</span>
                     </div>
                     <select class="input input-xs bg-torn-surface border border-torn-border split-remainder-cat" style="max-width:100px">
-                        <option value="train" selected>训练</option>
+                        <option value="train" ${defaultCat === 'train' ? 'selected' : ''}>训练</option>
                         <option value="boost">Boost</option>
-                        <option value="other">其他</option>
+                        <option value="other" ${defaultCat === 'other' ? 'selected' : ''}>其他</option>
                     </select>
                     <input type="hidden" class="split-remainder-amount" value="${remaining}" />
                 </div>
@@ -2038,14 +3294,14 @@ window.FinancePage = {
 
         const directCount = directTaxItems.length;
         const directNote = directCount > 0
-            ? `<div class="text-gray-400 text-sm mb-2">另有 <span class="text-torn-accent">${directCount}</span> 条金额 ≤ 税款的记录将直接设为"税务"</div>`
+            ? `<div class="text-gray-400 text-sm mb-2">另有 <span class="text-torn-accent">${directCount}</span> 条记录将直接设为"税务"（无需拆分）</div>`
             : '';
 
         const html = `
             <div class="p-6">
                 <h3 class="text-lg font-bold text-white mb-2">智能拆分建议</h3>
                 <div class="text-gray-400 text-sm mb-4">
-                    以下 <span class="text-torn-accent font-bold">${overTaxItems.length}</span> 条记录金额超过周税设置 (${Utils.formatMoney(taxAmount)})，建议拆分为税务 + 其他分类
+                    以下 <span class="text-torn-accent font-bold">${overTaxItems.length}</span> 条记录金额超过对应的员工税务配置，建议拆分为税务 + 其他分类
                 </div>
                 ${directNote}
                 <div class="text-xs text-gray-500 mb-3">取消勾选的记录将直接设为"税务"分类（不拆分）</div>
@@ -2069,7 +3325,7 @@ window.FinancePage = {
             let splitCount = 0;
             let directCount = 0;
 
-            for (const tx of overTaxItems) {
+            for (const { tx, taxAmount } of overTaxItems) {
                 const cb = document.querySelector(`.split-tax-cb[data-tx-id="${tx.id}"]`);
                 if (cb && cb.checked) {
                     // Split: delete original, create tax + remainder records
@@ -2131,7 +3387,7 @@ window.FinancePage = {
             }
 
             // 也收集拆分的税部分的周
-            for (const tx of overTaxItems) {
+            for (const { tx } of overTaxItems) {
                 var wk = self._autoMatchWeek(tx);
                 if (wk && wk !== '__unassigned__') {
                     splitAffectedWeeks[wk] = true;
@@ -2152,14 +3408,24 @@ window.FinancePage = {
     // ---- Modals ----
 
     _showAddTransactionModal() {
-        const empOptions = this.employees.map(e =>
-            `<option value="${e.player_id}">${e.name}</option>`
-        ).join('');
+        const sortedEmployeesForTx = [...this.employees].sort((a, b) => {
+            if (a.left_date && !b.left_date) return 1;
+            if (!a.left_date && b.left_date) return -1;
+            return a.name.localeCompare(b.name);
+        });
+        const empOptions = sortedEmployeesForTx.map(e => {
+            const nameLabel = e.left_date ? `${e.name}（已离职）` : e.name;
+            return `<option value="${e.player_id}">${nameLabel}</option>`;
+        }).join('');
 
         const html = `
             <div class="p-6">
                 <h3 class="text-lg font-bold text-white mb-4">添加交易</h3>
                 <div class="space-y-4">
+                    <div>
+                        <label class="text-gray-400 text-sm mb-1 block">日期</label>
+                        <input type="date" class="input" id="modal-tx-date" value="${Utils.todayKey()}" />
+                    </div>
                     <div>
                         <label class="text-gray-400 text-sm mb-1 block">员工</label>
                         <select class="input" id="modal-tx-emp">
@@ -2196,15 +3462,44 @@ window.FinancePage = {
         document.getElementById('modal-tx-save')?.addEventListener('click', async () => {
             const empId = document.getElementById('modal-tx-emp')?.value;
             const emp = this.employees.find(e => String(e.player_id) === String(empId));
+            const dateStr = document.getElementById('modal-tx-date')?.value || Utils.todayKey();
+            let ts = Date.now();
+            if (dateStr !== Utils.todayKey()) {
+                const d = new Date(dateStr);
+                if (!isNaN(d.getTime())) {
+                    ts = d.getTime();
+                }
+            }
             const tx = {
                 player_id: empId,
                 player_name: emp?.name || '',
-                date: Utils.todayKey(),
-                timestamp: Date.now(),
+                date: dateStr,
+                timestamp: ts,
                 amount: Utils.parseMoneyInput(document.getElementById('modal-tx-amount')?.value),
                 category: document.getElementById('modal-tx-cat')?.value || 'other',
                 note: document.getElementById('modal-tx-note')?.value || ''
             };
+
+            const playerTaxRate = this._getEmployeeTaxRate(empId);
+
+            if (tx.category === 'tax' && playerTaxRate > 0 && tx.amount > playerTaxRate) {
+                // Save it first to get an ID so the split modal can delete it
+                tx.week_key = this._autoMatchWeek(tx);
+                const savedId = await DB.put('transactions', tx);
+                tx.id = savedId;
+
+                Utils.hideModal();
+                let trainPrice = null;
+                try {
+                    const priceCfg = await DB.get('training_config', 'train_price');
+                    if (priceCfg && priceCfg.value !== undefined) {
+                        trainPrice = priceCfg.value;
+                    }
+                } catch (e) {}
+                this._showBulkTaxSplitModal([{ tx, taxAmount: playerTaxRate }], [], trainPrice);
+                return;
+            }
+
             tx.week_key = this._autoMatchWeek(tx);
             await DB.put('transactions', tx);
             // 交易保存后重算对应周
@@ -2225,6 +3520,10 @@ window.FinancePage = {
             <div class="p-6">
                 <h3 class="text-lg font-bold text-white mb-4">编辑交易</h3>
                 <div class="space-y-4">
+                    <div>
+                        <label class="text-gray-400 text-sm mb-1 block">日期</label>
+                        <input type="date" class="input" id="modal-edit-date" value="${tx.date || Utils.todayKey()}" />
+                    </div>
                     <div>
                         <label class="text-gray-400 text-sm mb-1 block">金额 ($)</label>
                         <input type="text" class="input money-input" id="modal-edit-amount" value="${tx.amount || 0}" placeholder="支持 k/m/b 后缀" />
@@ -2252,9 +3551,38 @@ window.FinancePage = {
         document.getElementById('modal-edit-cancel')?.addEventListener('click', () => Utils.hideModal());
 
         document.getElementById('modal-edit-save')?.addEventListener('click', async () => {
-            tx.amount = Utils.parseMoneyInput(document.getElementById('modal-edit-amount')?.value);
-            tx.category = document.getElementById('modal-edit-cat')?.value || 'other';
-            tx.note = document.getElementById('modal-edit-note')?.value || '';
+            const amount = Utils.parseMoneyInput(document.getElementById('modal-edit-amount')?.value);
+            const category = document.getElementById('modal-edit-cat')?.value || 'other';
+            const note = document.getElementById('modal-edit-note')?.value || '';
+            const dateStr = document.getElementById('modal-edit-date')?.value;
+
+            const playerTaxRate = this._getEmployeeTaxRate(tx.player_id);
+
+            // Update in-memory properties first so they are ready for split or save
+            tx.amount = amount;
+            tx.category = category;
+            tx.note = note;
+            if (dateStr && dateStr !== tx.date) {
+                tx.date = dateStr;
+                const d = new Date(dateStr);
+                if (!isNaN(d.getTime())) {
+                    tx.timestamp = d.getTime();
+                }
+            }
+
+            if (category === 'tax' && playerTaxRate > 0 && amount > playerTaxRate) {
+                Utils.hideModal();
+                let trainPrice = null;
+                try {
+                    const priceCfg = await DB.get('training_config', 'train_price');
+                    if (priceCfg && priceCfg.value !== undefined) {
+                        trainPrice = priceCfg.value;
+                    }
+                } catch (e) {}
+                this._showBulkTaxSplitModal([{ tx, taxAmount: playerTaxRate }], [], trainPrice);
+                return;
+            }
+
             var editOldWeekKey = tx.week_key;
             tx.week_key = this._autoMatchWeek(tx);
             await DB.put('transactions', tx);
@@ -2544,7 +3872,8 @@ window.FinancePage = {
             const existingLogIds = new Set(this.transactions.map(t => String(t.log_id)).filter(id => id && id !== 'undefined'));
             const allRelevant = [];
 
-            const currentEmployeeIds = new Set(this.employees.map(e => String(e.player_id)));
+            const activeEmployees = this.employees.filter(e => !e.left_date);
+            const currentEmployeeIds = new Set(activeEmployees.map(e => String(e.player_id)));
 
             // V2 log batches - each batch max 10 log type IDs
             const batches = [
@@ -2592,7 +3921,7 @@ window.FinancePage = {
             Utils.hideLoading();
 
             // Deduplicate trades
-            const deduped = this._deduplicateTrades(allRelevant);
+            const deduped = this._deduplicateTrades(allRelevant, existingLogIds);
 
             if (!deduped.length) {
                 Utils.toast('未找到新的相关日志条目', 'info');
@@ -2616,7 +3945,7 @@ window.FinancePage = {
                         </select>
                         <select id="modal-ad-filter-emp" class="input input-sm shrink-0 truncate" style="max-width: 120px;">
                             <option value="">全部员工</option>
-                            ${this.employees.map(e => `<option value="${e.player_id}">${e.name}</option>`).join('')}
+                            ${activeEmployees.map(e => `<option value="${e.player_id}">${e.name}</option>`).join('')}
                         </select>
                         <div class="flex items-center gap-2 ml-auto mr-2 whitespace-nowrap shrink-0">
                             <input type="checkbox" id="modal-ad-select-all" class="cursor-pointer" checked />
@@ -2762,7 +4091,10 @@ window.FinancePage = {
         }
     },
 
-    _deduplicateTrades(allRelevant) {
+    _deduplicateTrades(allRelevant, existingLogIds) {
+        if (!existingLogIds) {
+            existingLogIds = new Set((this.transactions || []).map(t => String(t.log_id)).filter(id => id && id !== 'undefined'));
+        }
         const tradeEntries = [];
         const nonTrade = [];
 
@@ -2795,6 +4127,11 @@ window.FinancePage = {
 
         const dedupedTrade = [];
         for (const [tradeId, steps] of Object.entries(byTradeId)) {
+            // Skip if this trade is already in the database
+            if (existingLogIds.has(`trade_final_${tradeId}`)) {
+                continue;
+            }
+
             steps.sort((a, b) => (a.entry.timestamp || 0) - (b.entry.timestamp || 0));
 
             // Only include completed trades: must have 'total' field AND not expired/cancelled
@@ -2808,15 +4145,33 @@ window.FinancePage = {
             });
             if (isExpiredOrCancelled) continue;
 
-            // Aggregate money and items from all steps
+            // Aggregate money and items from final transfer steps (4440, 4441, 4445, 4446)
             let totalMoney = 0;
             const allItems = [];
             const traderUser = steps[0]?.entry?.data?.user || 0;
 
-            for (const step of steps) {
-                const d = step.entry?.data || {};
-                if (d.money) totalMoney += d.money;
-                if (d.items) allItems.push(...d.items);
+            const transferSteps = steps.filter(s => {
+                const type = s.entry?.details?.id || 0;
+                return type === 4440 || type === 4441 || type === 4445 || type === 4446;
+            });
+
+            if (transferSteps.length > 0) {
+                for (const step of transferSteps) {
+                    const d = step.entry?.data || {};
+                    if (d.money) totalMoney += d.money;
+                    if (d.items) allItems.push(...d.items);
+                }
+            } else {
+                // Fallback: if there are no transfer steps in the logs (e.g. truncated logs),
+                // aggregate from workspace steps but exclude completion/acceptance/initiation
+                for (const step of steps) {
+                    const logType = step.entry?.details?.id || 0;
+                    if (logType === 4430 || logType === 4431 || logType === 4400 || logType === 4401) continue;
+
+                    const d = step.entry?.data || {};
+                    if (d.money) totalMoney += d.money;
+                    if (d.items) allItems.push(...d.items);
+                }
             }
 
             // Merge duplicate items

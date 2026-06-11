@@ -352,6 +352,18 @@ window.UI = {
   },
 
   /**
+   * Star Pattern - Renders star ratings 1-10 in unique geometric shapes using CSS Grid
+   * @param {number} rating - Star rating (1 to 10)
+   * @returns {string} HTML string
+   */
+  starPattern(rating) {
+    const r = Math.max(0, Math.min(10, parseInt(rating) || 0));
+    if (r === 0) return `<span class="text-gray-600">无星级</span>`;
+    return `<span class="text-white font-bold">${r}⭐</span>`;
+  },
+
+
+  /**
    * Initialize sortable table - Attach click handlers to sortable headers
    * @param {string} tableId - The table element id
    */

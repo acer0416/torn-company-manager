@@ -3,7 +3,7 @@
 window.TrainingPage = {
     employees: [],
     records: [],
-    config: { weekly_free_trains: 0, train_price: 50000 },
+    config: { weekly_free_trains: 0, train_price: DEFAULT_TRAIN_PRICE, weekly_available_trains: 0 },
     _trainsAvailable: 0,
     _apiTrainCounts: {},
     _eventsBound: false,
@@ -52,7 +52,10 @@ window.TrainingPage = {
             }
         }
         this.config.weekly_free_trains = cfg?.value ?? 0;
-        this.config.train_price = price?.value ?? 50000;
+        this.config.train_price = price?.value ?? DEFAULT_TRAIN_PRICE;
+        
+        const availCfg = await DB.get('training_config', 'weekly_available_trains');
+        let defaultAvailable = 0;
 
         // Load training records for current week
         const allRecords = await DB.getAll('training_records');
@@ -77,16 +80,28 @@ window.TrainingPage = {
         // 同步员工到 employees_master（幂等，不标记离职）
         await Utils.syncEmployeesMaster(this.employees);
 
-        // Fetch trains_available from API
-        try {
-            const detail = await TornAPI.getCompanyDetailed();
-            this._trainsAvailable = detail?.company_detailed?.trains_available
-                ?? detail?.trains_available
-                ?? detail?.company?.trains_available
-                ?? 0;
-        } catch (e) {
-            this._trainsAvailable = '-';
+        // Get companyData from AppCache (pre-populated on app start) to avoid API call loading delays
+        let companyData = AppCache.get('companyData');
+        if (!companyData) {
+            try {
+                companyData = await AppCache.getOrFetch('companyData', () => TornAPI.getCompanyData());
+            } catch (e) {
+                console.warn('[TrainingPage] Failed to fetch companyData:', e.message);
+            }
         }
+
+        if (companyData) {
+            this._trainsAvailable = companyData.detailed?.trains_available
+                ?? companyData.profile?.trains_available
+                ?? 0;
+            const rating = companyData.profile?.rating || 0;
+            defaultAvailable = rating * 7;
+        } else {
+            this._trainsAvailable = '-';
+            defaultAvailable = 0;
+        }
+        
+        this.config.weekly_available_trains = availCfg?.value !== undefined ? availCfg.value : defaultAvailable;
 
         // 统一使用本地 training_records 作为唯一数据源计算看板和员工列表的训练次数
         this._apiTrainCounts = {};
@@ -100,6 +115,9 @@ window.TrainingPage = {
             const allTx = await DB.getAll('transactions') || [];
             const allAllocations = await DB.getAll('train_fund_allocations') || [];
             const allTrainTxs = allTx.filter(tx => tx.category === 'train');
+            
+            const allMasters = await DB.getAll('employees_master') || [];
+            this._leftEmpIds = new Set(allMasters.filter(m => m.left_date).map(m => String(m.player_id)));
             
             // For revenue overview (this week only)
             const wkStart = Utils.weekDateRange(this._currentWeek).start.getTime();
@@ -122,7 +140,7 @@ window.TrainingPage = {
             for (const tx of allTrainTxs) {
                 if (!allocsByFinanceId.has(String(tx.id))) {
                     // Create new allocation
-                    const trainPrice = this.config.train_price || 50000;
+                    const trainPrice = this.config.train_price || DEFAULT_TRAIN_PRICE;
                     const amount = Number(tx.amount) || 0;
                     const expectedCount = Math.floor(amount / trainPrice);
                     
@@ -195,17 +213,23 @@ window.TrainingPage = {
                 allTrainingRecords = await DB.getAll('training_records') || [];
             }
             
+            // 按创建时间正序排序资金分配，确保旧分配优先被消耗
+            allAllocations.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
             allTrainingRecords.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0)); // 按时间正序，优先抵扣历史欠训
+            
             for (const alloc of allAllocations) {
-                if (alloc.weekKey !== this._currentWeek) continue;
+                if (alloc.weekKey > this._currentWeek) continue; // 跳过未来周的分配
+                // 剔除已离职员工的结转资金：如果分配是历史周的，且员工已离职，则不进行匹配
+                if (alloc.weekKey < this._currentWeek && this._leftEmpIds && this._leftEmpIds.has(String(alloc.employeeId))) continue;
                 const actualFulfilled = allTrainingRecords.filter(r => r.note === 'fund:' + alloc.id).length;
                 let needed = alloc.expectedCount - actualFulfilled;
                 if (needed > 0) {
                     const empRecords = allTrainingRecords.filter(r => 
                         String(r.player_id) === String(alloc.employeeId) && 
-                        r.week <= alloc.weekKey && // 允许跨周匹配之前的未付款训练
+                        r.week <= this._currentWeek && // 允许匹配到当前查看周或之前的训练记录（支持结转和后补）
                         !(r.note && r.note.startsWith('fund:')) &&
-                        r.type !== 'paid'
+                        r.type !== 'paid' &&
+                        r.manual_unmatched !== true
                     );
                     
                     for (let i = 0; i < empRecords.length && needed > 0; i++) {
@@ -236,9 +260,13 @@ window.TrainingPage = {
         // 加载训练资金分配汇总，并更新 fulfilledCount
         this._trainFundSummary = await this._loadTrainFundSummary();
         
-        // 加载所有自动生成的分配，用于展示
+        // 加载所有自动生成的分配，用于展示（包含本周的新分配，以及未完成且未离职的历史分配）
         const finalAllocs = await DB.getAll('train_fund_allocations') || [];
-        this._trainFundAllocations = finalAllocs.filter(a => a.weekKey === this._currentWeek);
+        const leftIds = this._leftEmpIds || new Set();
+        this._trainFundAllocations = finalAllocs.filter(a => 
+            a.weekKey === this._currentWeek || 
+            (a.weekKey < this._currentWeek && (a.fulfilledCount || 0) < (a.expectedCount || 0) && !leftIds.has(String(a.employeeId)))
+        );
     },
 
     // 从 IndexedDB 加载当前周的训练资金分配汇总
@@ -249,7 +277,12 @@ window.TrainingPage = {
 
         try {
             const allAllocations = await DB.getAll('train_fund_allocations');
-            const wkAllocations = (allAllocations || []).filter(a => a.weekKey === wk);
+            // 包含当前周的分配，以及未完成且未离职的历史分配
+            const leftIds = this._leftEmpIds || new Set();
+            const wkAllocations = (allAllocations || []).filter(a => 
+                a.weekKey === wk || 
+                (a.weekKey < wk && (a.fulfilledCount || 0) < (a.expectedCount || 0) && !leftIds.has(String(a.employeeId)))
+            );
 
             // 获取全部训练记录（跨周），因为可能抵扣了历史记录
             const allRecords = await DB.getAll('training_records') || [];
@@ -310,7 +343,7 @@ window.TrainingPage = {
                         <i class="fas fa-plus"></i> 添加记录
                     </button>
                     <button class="btn btn-accent" data-action="refetch-train-data">
-                        <i class="fas fa-cloud-download-alt"></i> 重新拉取训练数据
+                        <i class="fas fa-cloud-download-alt"></i> 拉取训练数据
                     </button>
                     <button class="btn btn-secondary" data-action="refresh">
                         <i class="fas fa-sync-alt"></i> 刷新
@@ -321,15 +354,23 @@ window.TrainingPage = {
     },
 
     _configHTML() {
+        const totalFreeTrains = this.config.weekly_free_trains * this.employees.length;
+        const sellableCount = Math.max(0, this.config.weekly_available_trains - totalFreeTrains);
+        const estimatedRev = sellableCount * (this.config.train_price || 0);
+
         return `
             <div class="card mb-6">
                 <h3 class="text-lg font-bold text-white mb-4">
                     <i class="fas fa-cog mr-2 text-gray-400"></i>训练配置
                 </h3>
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
                     <div>
                         <div class="text-gray-400 text-sm mb-1">可用训练次数 (API)</div>
                         <div class="text-torn-gold text-xl font-bold" id="trains-available">${this._trainsAvailable}</div>
+                    </div>
+                    <div>
+                        <div class="text-gray-400 text-sm mb-1">预估每周可用训练数</div>
+                        <input type="number" min="0" class="input" id="cfg-weekly-available" value="${this.config.weekly_available_trains}" />
                     </div>
                     <div>
                         <div class="text-gray-400 text-sm mb-1">每周免费训练次数</div>
@@ -337,9 +378,21 @@ window.TrainingPage = {
                     </div>
                     <div>
                         <div class="text-gray-400 text-sm mb-1">训练价格 ($/次)</div>
-                        <input type="text" class="input money-input" id="cfg-train-price" value="${(this.config.train_price || 50000).toLocaleString('en-US')}" placeholder="支持 k/m/b 后缀" />
+                        <input type="text" class="input money-input" id="cfg-train-price" value="${(this.config.train_price || DEFAULT_TRAIN_PRICE).toLocaleString('en-US')}" placeholder="支持 k/m/b 后缀" />
                     </div>
                 </div>
+                
+                <div class="mt-4 p-3 bg-torn-surface border border-torn-border rounded flex justify-between items-center">
+                    <div>
+                        <div class="text-sm text-gray-400">总员工数: <span class="text-white">${this.employees.length}</span></div>
+                        <div class="text-sm text-gray-400">预估免费消耗: <span class="text-white">${totalFreeTrains}</span> 次/周</div>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-sm text-gray-400">每周可售数量: <span class="text-white font-bold text-lg">${sellableCount}</span> 次</div>
+                        <div class="text-sm text-gray-400">预估收益: <span class="text-torn-gold font-bold text-lg">${Utils.formatMoney(estimatedRev)}</span></div>
+                    </div>
+                </div>
+
                 <button class="btn btn-primary mt-4" data-action="save-config">
                     <i class="fas fa-save"></i> 保存配置
                 </button>
@@ -357,19 +410,43 @@ window.TrainingPage = {
         const txRevenue = (this._trainTransactions || []).reduce((s, tx) => s + (tx.amount || 0), 0);
         const totalRevenue = txRevenue > 0 ? txRevenue : recordRevenue;
 
-        // 计算待完成训练总数
+        // 计算当前在职员工的训练总次数
+        const activeEmpIds = new Set((this.employees || []).map(e => String(e.player_id)));
+        let activeTotalTrains = 0;
+        for (const [pid, count] of Object.entries(apiCounts)) {
+            if (activeEmpIds.has(pid)) {
+                activeTotalTrains += Number(count) || 0;
+            }
+        }
+
+        // 计算在职员工多训总次数与待完成训练数
+        const trainPrice = this.config.train_price || DEFAULT_TRAIN_PRICE;
+        let totalExcessTrains = 0;
         const fundSummary = this._trainFundSummary || new Map();
         let pendingTotal = 0;
-        for (const entry of fundSummary.values()) {
-            pendingTotal += entry.remaining;
-        }
+
+        this.employees.forEach(emp => {
+            const empRecords = records.filter(r => String(r.player_id) === String(emp.player_id));
+            const freeGiven = empRecords.filter(r => r.type === 'free').reduce((s, r) => s + (Number(r.trains_count) || 1), 0);
+            const freeRemaining = Math.max(0, this.config.weekly_free_trains - freeGiven);
+            const excessFree = Math.max(0, freeGiven - this.config.weekly_free_trains);
+            
+            totalExcessTrains += excessFree;
+            
+            const fundEntry = fundSummary.get(String(emp.player_id));
+            const paidRemaining = fundEntry ? fundEntry.remaining : 0;
+            
+            pendingTotal += freeRemaining + paidRemaining;
+        });
+
+        const totalOwed = totalExcessTrains * trainPrice;
 
         return `
             <div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-6">
-                ${UI.kpiCard('fas fa-dumbbell', '本周训练总次数', apiTotalTrains, '来自 Torn API', 'accent')}
+                ${UI.kpiCard('fas fa-dumbbell', '本周训练总次数', activeTotalTrains, '在职员工', 'accent')}
                 ${UI.kpiCard('fas fa-gift', '免费赠送', freeGiven, '本地记录', 'green')}
                 ${UI.kpiCard('fas fa-coins', '付费训练', paid, '本地记录', 'gold')}
-                ${UI.kpiCard('fas fa-dollar-sign', '训练收入', Utils.formatMoney(totalRevenue), `记录: ${Utils.formatMoney(recordRevenue)} | 交易: ${Utils.formatMoney(txRevenue)}`, 'blue')}
+                ${UI.kpiCard('fas fa-dollar-sign', '训练收入', Utils.formatMoney(totalRevenue), `实收: ${Utils.formatMoney(totalRevenue)} | 欠收: ${Utils.formatMoney(totalOwed)}`, 'blue')}
                 ${UI.kpiCard('fas fa-clock', '待完成训练', pendingTotal, '所有员工剩余应训练次数之和', 'orange')}
             </div>
         `;
@@ -382,17 +459,23 @@ window.TrainingPage = {
                     <i class="fas fa-calculator mr-2 text-torn-accent"></i>训练计算器
                 </h3>
                 <div class="flex flex-wrap items-end gap-4">
-                    <div class="flex-1 min-w-[200px]">
+                    <div class="flex-1 min-w-[150px]">
+                        <label class="text-gray-400 text-sm mb-1 block">单价 ($)</label>
+                        <input type="text" class="input money-input" id="calc-price" value="${(this.config.train_price || 0).toLocaleString('en-US')}" placeholder="默认使用配置价格" />
+                    </div>
+                    <div class="flex-1 min-w-[150px]">
                         <label class="text-gray-400 text-sm mb-1 block">支付金额 ($)</label>
-                        <input type="text" class="input money-input" id="calc-amount" placeholder="支持 k/m/b 后缀，如 5m" />
+                        <input type="text" class="input money-input" id="calc-amount" placeholder="如 5m，或留空算金额" oninput="this.dataset.edited=Date.now()" />
+                    </div>
+                    <div class="flex-1 min-w-[150px]">
+                        <label class="text-gray-400 text-sm mb-1 block">训练次数</label>
+                        <input type="number" class="input" id="calc-count" min="0" placeholder="如 100，或留空算次数" oninput="this.dataset.edited=Date.now()" />
                     </div>
                     <button class="btn btn-primary" data-action="calculate">
                         <i class="fas fa-calculator"></i> 计算
                     </button>
-                    <div class="flex-1 min-w-[200px]">
-                        <label class="text-gray-400 text-sm mb-1 block">可训练次数</label>
-                        <div class="text-torn-gold text-2xl font-bold py-2" id="calc-result">0</div>
-                        <div class="text-xs text-gray-500" id="calc-hint"></div>
+                    <div class="w-full mt-2">
+                        <div class="text-sm" id="calc-hint">在金额或次数中任意输入一项，点击计算即可得出另一项。</div>
                     </div>
                 </div>
             </div>
@@ -412,22 +495,52 @@ window.TrainingPage = {
         const records = this.records;
         const apiCounts = this._apiTrainCounts || {};
         const fundSummary = this._trainFundSummary || new Map();
+        const trainPrice = this.config.train_price || DEFAULT_TRAIN_PRICE;
+        
         const rows = this.employees.map(emp => {
             const empRecords = records.filter(r => String(r.player_id) === String(emp.player_id));
             const apiCount = apiCounts[String(emp.player_id)];
             const trainsCount = apiCount !== undefined && apiCount !== null ? apiCount : 0;
             const totalPaid = empRecords.reduce((s, r) => s + (r.amount_paid || 0), 0);
 
-            // 计算剩余应训练次数
+            // 计算剩余应训练次数和多训次数
+            const freeGiven = empRecords.filter(r => r.type === 'free').reduce((s, r) => s + (Number(r.trains_count) || 1), 0);
+            const freeRemaining = Math.max(0, this.config.weekly_free_trains - freeGiven);
+            const excessFree = Math.max(0, freeGiven - this.config.weekly_free_trains);
+            
             const fundEntry = fundSummary.get(String(emp.player_id));
-            let remainingHTML = '<span class="text-gray-500">-</span>';
-            if (fundEntry) {
-                const remaining = fundEntry.remaining;
-                if (remaining > 0) {
-                    remainingHTML = `<span class="font-bold text-orange-400">${remaining}</span>`;
-                } else {
-                    remainingHTML = `<span class="font-bold text-green-400">已完成</span>`;
-                }
+            const paidRemaining = fundEntry ? fundEntry.remaining : 0;
+            
+            // 计算欠费：付费训练中，实际付款低于单价的总额（非 fund 关联或 underpaid）
+            let totalOwed = 0;
+            const paidRecs = empRecords.filter(r => r.type === 'paid');
+            for (const r of paidRecs) {
+                const cost = (Number(r.trains_count) || 1) * trainPrice;
+                const owed = Math.max(0, cost - (Number(r.amount_paid) || 0));
+                totalOwed += owed;
+            }
+            
+            let remainingHTML = '';
+            const parts = [];
+            if (freeRemaining > 0) {
+                parts.push(`<span class="text-green-400" title="剩余免费训练">免费:${freeRemaining}</span>`);
+            }
+            if (paidRemaining > 0) {
+                parts.push(`<span class="text-orange-400" title="剩余付费训练">付费:${paidRemaining}</span>`);
+            }
+            if (excessFree > 0) {
+                parts.push(`<span class="text-yellow-400 font-bold" title="超出免费额度的多训次数">多训:${excessFree}</span>`);
+            }
+            if (totalOwed > 0) {
+                parts.push(`<span class="text-red-400 font-bold" title="付费训练未付金额">欠费:${Utils.formatMoney(totalOwed)}</span>`);
+            }
+
+            if (parts.length > 0) {
+                remainingHTML = `<div class="flex flex-col text-sm">${parts.join('')}</div>`;
+            } else if (this.config.weekly_free_trains > 0 || (fundEntry && fundEntry.expectedCount > 0)) {
+                remainingHTML = `<span class="font-bold text-gray-500">已完成</span>`;
+            } else {
+                remainingHTML = '<span class="text-gray-500">-</span>';
             }
 
             return {
@@ -467,12 +580,47 @@ window.TrainingPage = {
             { key: 'actions', label: '操作', sortable: false }
         ];
 
+        // 识别出哪些 free 训练超出了每周免费限额 (按员工和时间排序)
+        const excessRecordIds = new Set();
+        const empFreeRecords = {};
+        this.records.forEach(r => {
+            if (r.type === 'free') {
+                const pid = String(r.player_id);
+                if (!empFreeRecords[pid]) empFreeRecords[pid] = [];
+                empFreeRecords[pid].push(r);
+            }
+        });
+
+        Object.keys(empFreeRecords).forEach(pid => {
+            const list = empFreeRecords[pid];
+            list.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+            
+            let freeLimit = this.config.weekly_free_trains;
+            list.forEach(r => {
+                const count = Number(r.trains_count) || 1;
+                if (freeLimit > 0) {
+                    if (freeLimit >= count) {
+                        freeLimit -= count;
+                    } else {
+                        freeLimit = 0;
+                        excessRecordIds.add(r.id);
+                    }
+                } else {
+                    excessRecordIds.add(r.id);
+                }
+            });
+        });
+
         const rows = this.records.map(rec => {
             const isChecked = (this._selectedRecordIds && this._selectedRecordIds.has(rec.id)) ? 'checked' : '';
             const isFundRecord = rec.note && rec.note.startsWith('fund:');
             const fundIcon = isFundRecord ? ' 💰' : '';
+            
+            const isExcess = excessRecordIds.has(rec.id);
+            const excessBadge = isExcess ? ' <span class="badge badge-yellow" title="超出每周免费限额，建议修改为付费">多训</span>' : '';
+            
             const typeBadge = rec.type === 'free'
-                ? '<span class="badge badge-green">free</span>'
+                ? `<span class="badge badge-green">free</span>${excessBadge}`
                 : `<span class="badge badge-blue">${rec.type}${fundIcon}</span>`;
 
             return {
@@ -494,8 +642,8 @@ window.TrainingPage = {
                     已选择 <span id="selected-count" class="text-torn-accent font-bold">0</span> 条记录
                 </span>
                 <div class="flex gap-2">
-                    <button class="btn btn-xs btn-accent" data-action="batch-set-category" id="btn-batch-set-category">
-                        <i class="fas fa-folder"></i> 批量设置分类
+                    <button class="btn btn-xs btn-accent" data-action="batch-edit-records" id="btn-batch-edit-records">
+                        <i class="fas fa-edit"></i> 批量编辑
                     </button>
                     <button class="btn btn-xs btn-danger" data-action="batch-delete" id="btn-batch-delete">
                         <i class="fas fa-trash"></i> 批量删除
@@ -504,11 +652,23 @@ window.TrainingPage = {
             </div>
         `;
 
+        const allNames = new Set([
+            ...this.employees.map(e => e.name),
+            ...(this._allRecords || this.records).map(r => r.player_name).filter(n => n)
+        ]);
+        const sortedNames = Array.from(allNames).sort((a, b) => a.localeCompare(b));
+        
+        const filterOptions = sortedNames.map(name => 
+            `<option value="${name}" ${this._nameFilterValue === name ? 'selected' : ''}>${name}</option>`
+        ).join('');
+
         const nameFilterBar = `
             <div class="flex items-center gap-2 mb-3" id="name-filter-bar">
                 <div class="relative flex-1 max-w-xs">
-                    <input type="text" class="input" id="train-name-filter" placeholder="按员工名称筛选..." value="${this._nameFilterValue || ''}" />
-                    ${this._nameFilterValue ? `<button class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white" id="clear-name-filter" style="background:none;border:none;cursor:pointer;line-height:1;">&times;</button>` : ''}
+                    <select class="input" id="train-name-filter">
+                        <option value="">-- 全部员工 --</option>
+                        ${filterOptions}
+                    </select>
                 </div>
             </div>
         `;
@@ -613,51 +773,83 @@ window.TrainingPage = {
         if (!emp) return;
 
         const allAllocations = await DB.getAll('train_fund_allocations') || [];
-        const wkAllocations = allAllocations.filter(a => a.weekKey === this._currentWeek && String(a.employeeId) === String(empId));
+        const allRecords = await DB.getAll('training_records') || [];
+
+        // 筛选出当前周活跃的资金分配（本周新建、历史未完成且未离职、或在当前周有抵扣记录的历史分配）
+        const leftIds = this._leftEmpIds || new Set();
+        const wkAllocations = allAllocations.filter(a => {
+            if (String(a.employeeId) !== String(empId)) return false;
+            if (a.weekKey > this._currentWeek) return false;
+            if (a.weekKey === this._currentWeek) return true;
+            
+            const isLeft = leftIds.has(String(a.employeeId));
+            if (isLeft) {
+                // 如果已离职，只有在当前周有抵扣记录的历史分配才被视作活跃
+                const hasMatchedInCurrentWeek = allRecords.some(r => 
+                    r.week === this._currentWeek && r.note === 'fund:' + a.id
+                );
+                return hasMatchedInCurrentWeek;
+            }
+            
+            if ((a.fulfilledCount || 0) < (a.expectedCount || 0)) return true;
+            
+            const hasMatchedInCurrentWeek = allRecords.some(r => 
+                r.week === this._currentWeek && r.note === 'fund:' + a.id
+            );
+            return hasMatchedInCurrentWeek;
+        });
         
         if (wkAllocations.length === 0) {
-            Utils.toast('未找到本周的资金分配记录', 'info');
+            Utils.toast('未找到相关的资金分配记录', 'info');
             return;
         }
 
         const allocIds = wkAllocations.map(a => a.id);
-        const allRecords = await DB.getAll('training_records') || [];
         
         // 筛选出被抵扣到这些资金分配上的记录
         const matchedRecords = allRecords.filter(r => r.note && allocIds.some(id => r.note === 'fund:' + id));
 
+        // 默认按时间倒序
+        matchedRecords.sort((a, b) => {
+            const timeA = a.timestamp || new Date(a.raw_date || a.date || 0).getTime();
+            const timeB = b.timestamp || new Date(b.raw_date || b.date || 0).getTime();
+            return timeB - timeA;
+        });
+
+        const headers = [
+            { key: '_checkbox', label: '<input type="checkbox" id="select-all-fund-records" />', sortable: false, width: '40px' },
+            { key: 'timeStr', label: '训练时间', sortable: true },
+            { key: 'week', label: '归属周', sortable: true },
+            { key: 'amount', label: '抵扣金额', sortable: true },
+            { key: 'actions', label: '操作', sortable: false }
+        ];
+
+        const rows = matchedRecords.map(r => {
+            return {
+                id: r.id,
+                _checkbox: `<input type="checkbox" class="fund-record-checkbox" data-record-id="${r.id}" />`,
+                timeStr: r.timestamp ? Utils.formatDateTime(r.timestamp) : (r.raw_date || r.date || '-'),
+                week: r.week,
+                amount: `<span class="text-torn-green font-bold">${Utils.formatMoney(r.amount_paid || 0)}</span>`,
+                actions: `<button class="btn btn-xs btn-secondary" data-action="unmatch-fund-record" data-record-id="${r.id}">解除</button>`
+            };
+        });
+
         const html = `
             <div class="p-6 w-[800px] max-w-[90vw]">
                 <h3 class="text-lg font-bold text-white mb-2">资金抵扣明细 - ${emp.name}</h3>
-                <div class="text-gray-400 text-sm mb-4">展示本周该员工名下资金所匹配的所有训练记录</div>
-                <div class="overflow-x-auto">
-                    <table class="w-full text-left border-collapse">
-                        <thead>
-                            <tr class="bg-torn-surface text-gray-400 text-sm border-b border-torn-border">
-                                <th class="p-2">训练时间</th>
-                                <th class="p-2">归属周</th>
-                                <th class="p-2">分类</th>
-                                <th class="p-2">抵扣金额</th>
-                                <th class="p-2 text-right">操作</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${matchedRecords.length === 0 ? `
-                                <tr><td colspan="5" class="p-4 text-center text-gray-500 text-sm">暂无匹配记录</td></tr>
-                            ` : matchedRecords.map(r => `
-                                <tr class="border-b border-torn-border/50 hover:bg-torn-surface/50 text-sm">
-                                    <td class="p-2 text-white">${Utils.formatDateTime(r.timestamp) || r.raw_date}</td>
-                                    <td class="p-2 text-gray-300">${r.week}</td>
-                                    <td class="p-2 text-gray-300">${(window.TRAIN_CATEGORIES.find(c => c.id === (r.category || 'other')) || {name: r.category || 'other'}).name}</td>
-                                    <td class="p-2 text-torn-green font-bold">${Utils.formatMoney(r.amount_paid || 0)}</td>
-                                    <td class="p-2 text-right">
-                                        <button class="btn btn-xs btn-secondary" data-action="unmatch-fund-record" data-record-id="${r.id}">解除抵扣</button>
-                                    </td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
-                    </table>
+                <div class="flex justify-between items-center mb-4">
+                    <div class="text-gray-400 text-sm">展示本周该员工名下资金所匹配的所有训练记录</div>
+                    <button class="btn btn-xs btn-danger" id="btn-batch-unmatch-fund" style="display: none;">
+                        <i class="fas fa-unlink"></i> 批量解除 (<span id="fund-selected-count">0</span>)
+                    </button>
                 </div>
+                ${UI.dataTable({
+                    headers,
+                    rows,
+                    id: 'fund-details-table',
+                    emptyText: '暂无匹配记录'
+                })}
                 <div class="flex justify-end mt-6">
                     <button class="btn btn-secondary" id="modal-fund-close">关闭</button>
                 </div>
@@ -665,35 +857,95 @@ window.TrainingPage = {
         `;
 
         Utils.showModal(html);
+        UI.initSortable('fund-details-table');
 
         document.getElementById('modal-fund-close')?.addEventListener('click', () => Utils.hideModal());
 
-        // unbind previous delegated events on modal content if any
         const modalContent = document.getElementById('modal-content');
         if (modalContent) {
+            let selectedFundRecords = new Set();
+            
+            const updateBatchBtn = () => {
+                const btn = document.getElementById('btn-batch-unmatch-fund');
+                const countSpan = document.getElementById('fund-selected-count');
+                if (!btn || !countSpan) return;
+                countSpan.textContent = selectedFundRecords.size;
+                btn.style.display = selectedFundRecords.size > 0 ? 'inline-flex' : 'none';
+            };
+
             const unmatchHandler = async (e) => {
                 const btn = e.target.closest('[data-action="unmatch-fund-record"]');
-                if (!btn) return;
-                
-                if (!confirm('确定要解除这条记录的抵扣状态吗？\n它将被恢复为“免费训练”。')) return;
+                if (btn) {
+                    if (!confirm('确定要解除这条记录的抵扣状态吗？\\n它将被恢复为“免费训练”。')) return;
 
-                const idStr = String(btn.dataset.recordId);
-                const id = isNaN(Number(idStr)) ? idStr : Number(idStr);
+                    const idStr = String(btn.dataset.recordId);
+                    const id = isNaN(Number(idStr)) ? idStr : Number(idStr);
 
-                const rec = await DB.get('training_records', id);
-                if (rec) {
-                    rec.type = 'free';
-                    rec.amount_paid = 0;
-                    rec.note = 'api_sync'; // Restore to default api sync note
-                    await DB.put('training_records', rec);
-                    Utils.toast('已解除抵扣', 'success');
-                    Utils.hideModal();
+                    const rec = await DB.get('training_records', id);
+                    if (rec) {
+                        rec.type = 'free';
+                        rec.amount_paid = 0;
+                        rec.note = 'api_sync';
+                        rec.manual_unmatched = true;
+                        await DB.put('training_records', rec);
+                        Utils.toast('已解除抵扣', 'success');
+                        await this.render();
+                        this._showFundDetailsModal(empId);
+                    }
+                    return;
+                }
+
+                if (e.target.id === 'btn-batch-unmatch-fund' || e.target.closest('#btn-batch-unmatch-fund')) {
+                    if (!confirm(`确定要解除选中的 ${selectedFundRecords.size} 条记录的抵扣状态吗？\n它们将被恢复为“免费训练”。`)) return;
+                    
+                    let count = 0;
+                    for (const rid of selectedFundRecords) {
+                        const rec = await DB.get('training_records', rid);
+                        if (rec) {
+                            rec.type = 'free';
+                            rec.amount_paid = 0;
+                            rec.note = 'api_sync';
+                            rec.manual_unmatched = true;
+                            await DB.put('training_records', rec);
+                            count++;
+                        }
+                    }
+                    Utils.toast(`已成功解除 ${count} 条记录`, 'success');
                     await this.render();
+                    this._showFundDetailsModal(empId);
+                    return;
                 }
             };
             
             // simple hack to bind event uniquely
             modalContent.onclick = unmatchHandler;
+
+            modalContent.addEventListener('change', (e) => {
+                if (e.target.id === 'select-all-fund-records') {
+                    const checkboxes = modalContent.querySelectorAll('.fund-record-checkbox');
+                    checkboxes.forEach(cb => {
+                        cb.checked = e.target.checked;
+                        const idStr = cb.dataset.recordId;
+                        const id = isNaN(Number(idStr)) ? idStr : Number(idStr);
+                        if (e.target.checked) selectedFundRecords.add(id);
+                        else selectedFundRecords.delete(id);
+                    });
+                    updateBatchBtn();
+                } else if (e.target.classList.contains('fund-record-checkbox')) {
+                    const idStr = e.target.dataset.recordId;
+                    const id = isNaN(Number(idStr)) ? idStr : Number(idStr);
+                    if (e.target.checked) selectedFundRecords.add(id);
+                    else selectedFundRecords.delete(id);
+                    
+                    const allCb = document.getElementById('select-all-fund-records');
+                    if (allCb) {
+                        const total = modalContent.querySelectorAll('.fund-record-checkbox').length;
+                        allCb.checked = selectedFundRecords.size === total && total > 0;
+                        allCb.indeterminate = selectedFundRecords.size > 0 && selectedFundRecords.size < total;
+                    }
+                    updateBatchBtn();
+                }
+            });
         }
     },
 
@@ -727,6 +979,8 @@ window.TrainingPage = {
                 const action = btn.dataset.action;
                 switch (action) {
                     case 'refresh':
+                        AppCache.invalidate('employees');
+                        AppCache.invalidate('companyData');
                         await this.render();
                         break;
                     case 'prev-week':
@@ -739,10 +993,10 @@ window.TrainingPage = {
                         await this._refetchTrainData();
                         break;
                     case 'add-record':
-                        this.showAddModal();
+                        await this.showAddModal();
                         break;
                     case 'add-for-emp':
-                        this.showAddModal(btn.dataset.empId);
+                        await this.showAddModal(btn.dataset.empId);
                         break;
                     case 'save-config':
                         await this._saveConfig();
@@ -751,7 +1005,7 @@ window.TrainingPage = {
                         this._calculate();
                         break;
                     case 'edit-record':
-                        this._showEditModal(btn.dataset.recordId);
+                        await this._showEditModal(btn.dataset.recordId);
                         break;
                     case 'delete-record':
                         await this._deleteRecord(btn.dataset.recordId);
@@ -759,7 +1013,7 @@ window.TrainingPage = {
                     case 'batch-delete':
                         await this._batchDeleteRecords();
                         break;
-                    case 'batch-set-category':
+                    case 'batch-edit-records':
                         await this._batchSetCategory();
                         break;
                     case 'view-fund-details':
@@ -768,22 +1022,10 @@ window.TrainingPage = {
                 }
             });
 
-            c.addEventListener('input', (e) => {
+            c.addEventListener('change', (e) => {
                 if (Router.currentPage !== 'training') return;
                 if (e.target.id === 'train-name-filter') {
-                    this._filterRecordsByNameDebounced();
-                }
-            });
-
-            c.addEventListener('click', (e) => {
-                if (Router.currentPage !== 'training') return;
-                if (e.target.id === 'clear-name-filter') {
-                    const filterInput = document.getElementById('train-name-filter');
-                    if (filterInput) {
-                        filterInput.value = '';
-                        this._nameFilterValue = '';
-                        this._filterRecordsByName();
-                    }
+                    this._filterRecordsByName();
                 }
             });
         }
@@ -852,37 +1094,68 @@ window.TrainingPage = {
     async _saveConfig() {
         const freeTrains = parseInt(document.getElementById('cfg-free-trains')?.value) || 0;
         const trainPrice = Utils.parseMoneyInput(document.getElementById('cfg-train-price')?.value);
+        const weeklyAvailable = parseInt(document.getElementById('cfg-weekly-available')?.value) || 0;
+        
         this.config.weekly_free_trains = freeTrains;
         this.config.train_price = trainPrice;
+        this.config.weekly_available_trains = weeklyAvailable;
+        
         await DB.put('training_config', { key: 'weekly_free_trains', value: freeTrains });
         await DB.put('training_config', { key: 'train_price', value: trainPrice });
+        await DB.put('training_config', { key: 'weekly_available_trains', value: weeklyAvailable });
+        
         Utils.toast('训练配置已保存', 'success');
+        await this.render();
     },
 
     _calculate() {
-        const amount = Utils.parseMoneyInput(document.getElementById('calc-amount')?.value);
-        const priceInput = document.getElementById('cfg-train-price')?.value;
-        const pricePer = Utils.parseMoneyInput(priceInput) || this.config.train_price || 0;
-        const resultEl = document.getElementById('calc-result');
+        const amountInput = document.getElementById('calc-amount');
+        const countInput = document.getElementById('calc-count');
+        const priceInput = document.getElementById('calc-price');
         const hintEl = document.getElementById('calc-hint');
-        if (!resultEl) return;
-        if (!amount || amount <= 0) {
-            resultEl.textContent = '0';
-            if (hintEl) hintEl.textContent = '请输入支付金额';
-            return;
-        }
+
+        const amountStr = amountInput?.value;
+        const countStr = countInput?.value;
+        const priceStr = priceInput?.value;
+
+        const pricePer = Utils.parseMoneyInput(priceStr) || this.config.train_price || 0;
+
         if (!pricePer || pricePer <= 0) {
-            resultEl.textContent = '—';
-            if (hintEl) hintEl.textContent = '请先设置有效的训练单价';
+            if (hintEl) hintEl.innerHTML = '<span class="text-red-400">请先输入有效的单价</span>';
             return;
         }
-        const trains = Math.floor(amount / pricePer);
-        const remainder = amount - trains * pricePer;
-        resultEl.textContent = String(trains);
-        if (hintEl) {
-            hintEl.textContent = remainder > 0
-                ? `单价 ${Utils.formatMoney(pricePer)}，余 ${Utils.formatMoney(remainder)} 不足 1 次`
-                : `单价 ${Utils.formatMoney(pricePer)} × ${trains} 次 = ${Utils.formatMoney(trains * pricePer)}`;
+
+        const amount = Utils.parseMoneyInput(amountStr);
+        const count = parseInt(countStr, 10) || 0;
+
+        const amountEdited = parseInt(amountInput?.dataset?.edited || '0', 10);
+        const countEdited = parseInt(countInput?.dataset?.edited || '0', 10);
+
+        if (amount > 0 && (amountEdited >= countEdited || count <= 0)) {
+            // 按金额计算次数
+            const calcCount = Math.floor(amount / pricePer);
+            const remainder = amount - calcCount * pricePer;
+            if (countInput) {
+                countInput.value = calcCount;
+                countInput.dataset.edited = '0';
+            }
+            if (hintEl) {
+                hintEl.innerHTML = remainder > 0
+                    ? `<span class="text-torn-gold">计算结果：</span>金额 <span class="text-white font-bold">${Utils.formatMoney(amount)}</span> 可以训练 <span class="text-white font-bold">${calcCount}</span> 次 (余 ${Utils.formatMoney(remainder)})`
+                    : `<span class="text-torn-gold">计算结果：</span>金额 <span class="text-white font-bold">${Utils.formatMoney(amount)}</span> 刚好可以训练 <span class="text-white font-bold">${calcCount}</span> 次`;
+            }
+        } else if (count > 0) {
+            // 按次数计算金额
+            const calcAmount = count * pricePer;
+            if (amountInput) {
+                amountInput.value = calcAmount.toLocaleString('en-US');
+                amountInput.dataset.edited = '0';
+            }
+            if (hintEl) {
+                hintEl.innerHTML = `<span class="text-torn-gold">计算结果：</span><span class="text-white font-bold">${count}</span> 次训练需要支付金额 <span class="text-white font-bold">${Utils.formatMoney(calcAmount)}</span>`;
+            }
+        } else {
+            if (hintEl) hintEl.innerHTML = '<span class="text-gray-400">请输入支付金额或训练次数进行计算</span>';
         }
     },
 
@@ -907,15 +1180,22 @@ window.TrainingPage = {
             // entry = { playerId, playerName, timestamp, details: { title, category, stat_before, stat_after, stat_gain }, logId, newsId }
             let existing = null;
             if (entry.logId) {
-                existing = allRecords.find(r => r.note === `log:${entry.logId}`);
+                existing = allRecords.find(r => r.sync_id === `log:${entry.logId}` || r.note === `log:${entry.logId}`);
             }
             if (!existing && entry.newsId) {
-                existing = allRecords.find(r => r.note === `news:${entry.newsId}`);
+                existing = allRecords.find(r => r.sync_id === `news:${entry.newsId}` || r.note === `news:${entry.newsId}`);
             }
             
             if (existing) {
                 // Update missing details if needed
                 let changed = false;
+                if (entry.logId && !existing.sync_id) {
+                    existing.sync_id = `log:${entry.logId}`;
+                    changed = true;
+                } else if (entry.newsId && !existing.sync_id) {
+                    existing.sync_id = `news:${entry.newsId}`;
+                    changed = true;
+                }
                 if (!existing.timestamp && entry.timestamp) {
                     existing.timestamp = entry.timestamp * 1000;
                     changed = true;
@@ -926,6 +1206,11 @@ window.TrainingPage = {
                 if (empObj && existing.player_name !== empObj.name) {
                     existing.player_name = empObj.name;
                     existing.player_id = empObj.player_id;
+                    changed = true;
+                }
+                
+                if (!existing.date && entry.timestamp) {
+                    existing.date = new Date(entry.timestamp * 1000).toISOString().slice(0, 10);
                     changed = true;
                 }
 
@@ -948,8 +1233,10 @@ window.TrainingPage = {
                     category: entry.details?.category || 'other',
                     raw_text: entry.details?.title || entry.rawText,
                     raw_date: new Date(entry.timestamp * 1000).toISOString(),
+                    date: new Date(entry.timestamp * 1000).toISOString().slice(0, 10),
                     timestamp: entry.timestamp * 1000,
                     note: entry.logId ? `log:${entry.logId}` : (entry.newsId ? `news:${entry.newsId}` : 'api_sync'),
+                    sync_id: entry.logId ? `log:${entry.logId}` : (entry.newsId ? `news:${entry.newsId}` : 'api_sync'),
                     created_at: Date.now()
                 };
                 await DB.put('training_records', record);
@@ -971,13 +1258,11 @@ window.TrainingPage = {
 
             await this._mergeApiEntriesToRecords(entries);
 
-            // 更新可用训练次数
+            // 更新可用训练次数并更新缓存
             try {
-                const detail = await TornAPI.getCompanyDetailed();
-                this._trainsAvailable = detail?.company_detailed?.trains_available
-                    ?? detail?.trains_available
-                    ?? detail?.company?.trains_available
-                    ?? 0;
+                const data = await TornAPI.getCompanyData();
+                AppCache.set('companyData', data);
+                this._trainsAvailable = data?.detailed?.trains_available ?? 0;
             } catch (e2) {
                 console.warn('[TrainingPage] refetch detailed:', e2.message);
             }
@@ -1077,7 +1362,50 @@ window.TrainingPage = {
       return null;
     },
 
-    _showEditModal(recordId) {
+    _updateFundSelectHTML(empId, allAllocations, currentNote, selectId, amountInputId) {
+        const container = document.getElementById(selectId + '-container');
+        if (!container) return;
+        
+        // 筛选出可以关联的资金分配：本周新建的、历史未完成且未离职的、或者当前已关联的那个分配
+        const leftIds = this._leftEmpIds || new Set();
+        const empAllocs = allAllocations.filter(a => 
+            String(a.employeeId) === String(empId) && 
+            (a.weekKey === this._currentWeek || 
+             (a.weekKey < this._currentWeek && (a.fulfilledCount || 0) < (a.expectedCount || 0) && !leftIds.has(String(a.employeeId))) ||
+             currentNote === 'fund:' + a.id)
+        );
+        let optionsHTML = '<option value="">-- 不关联 / 手动输入 --</option>';
+        empAllocs.forEach(a => {
+            const expected = a.expectedCount || 0;
+            const fulfilled = a.fulfilledCount || 0;
+            const remaining = Math.max(0, expected - fulfilled);
+            const isSelected = currentNote === 'fund:' + a.id ? 'selected' : '';
+            optionsHTML += `<option value="${a.id}" data-price="${a.trainPrice}" ${isSelected}>剩余: ${remaining}次 (单价: ${Utils.formatMoney(a.trainPrice)})</option>`;
+        });
+        
+        container.innerHTML = `
+            <label class="text-gray-400 text-sm mb-1 block">关联资金条目</label>
+            <select class="input" id="${selectId}">
+                ${optionsHTML}
+            </select>
+        `;
+
+        const selectEl = document.getElementById(selectId);
+        if (selectEl && amountInputId) {
+            selectEl.addEventListener('change', (e) => {
+                const opt = e.target.options[e.target.selectedIndex];
+                const price = opt.dataset.price;
+                if (price) {
+                    const amtInput = document.getElementById(amountInputId);
+                    if (amtInput && (!amtInput.value || amtInput.value === '0')) {
+                        amtInput.value = price;
+                    }
+                }
+            });
+        }
+    },
+
+    async _showEditModal(recordId) {
         const rec = this.records.find(r => String(r.id) === String(recordId));
         if (!rec) {
             Utils.toast('记录不存在', 'warning');
@@ -1087,6 +1415,8 @@ window.TrainingPage = {
             const sel = String(e.player_id) === String(rec.player_id) ? 'selected' : '';
             return `<option value="${e.player_id}" ${sel}>${e.name}</option>`;
         }).join('');
+
+        const allAllocations = await DB.getAll('train_fund_allocations') || [];
 
         const html = `
             <div class="p-6">
@@ -1111,6 +1441,7 @@ window.TrainingPage = {
                             <option value="paid" ${rec.type === 'paid' ? 'selected' : ''}>paid (付费)</option>
                         </select>
                     </div>
+                    <div id="edit-fund-select-container" style="${rec.type === 'paid' ? '' : 'display:none;'}"></div>
                     <div>
                         <label class="text-gray-400 text-sm mb-1 block">已付金额 ($)</label>
                         <input type="text" class="input money-input" id="edit-amount" value="${rec.amount_paid || 0}" />
@@ -1128,6 +1459,19 @@ window.TrainingPage = {
         `
         Utils.showModal(html);
 
+        this._updateFundSelectHTML(rec.player_id, allAllocations, rec.note, 'edit-fund-select', 'edit-amount');
+
+        document.getElementById('edit-type')?.addEventListener('change', (e) => {
+            const container = document.getElementById('edit-fund-select-container');
+            if (container) {
+                container.style.display = e.target.value === 'paid' ? '' : 'none';
+            }
+        });
+
+        document.getElementById('edit-emp-select')?.addEventListener('change', (e) => {
+            this._updateFundSelectHTML(e.target.value, allAllocations, rec.note, 'edit-fund-select', 'edit-amount');
+        });
+
         document.getElementById('edit-train-cancel')?.addEventListener('click', () => Utils.hideModal());
         document.getElementById('edit-train-save')?.addEventListener('click', async () => {
             const empId = document.getElementById('edit-emp-select')?.value;
@@ -1139,7 +1483,14 @@ window.TrainingPage = {
             rec.trains_count = parseInt(document.getElementById('edit-trains')?.value, 10) || 1;
             rec.type = document.getElementById('edit-type')?.value || 'paid';
             rec.amount_paid = Utils.parseMoneyInput(document.getElementById('edit-amount')?.value);
-            rec.note = document.getElementById('edit-note')?.value?.trim() || '';
+            
+            const fundSelect = document.getElementById('edit-fund-select');
+            if (rec.type === 'paid' && fundSelect && fundSelect.value) {
+                rec.note = 'fund:' + fundSelect.value;
+            } else {
+                rec.note = document.getElementById('edit-note')?.value?.trim() || '';
+            }
+
             await DB.put('training_records', rec);
             Utils.toast('训练记录已更新', 'success');
             Utils.hideModal();
@@ -1147,11 +1498,13 @@ window.TrainingPage = {
         });
     },
 
-    showAddModal(preselectedEmpId) {
+    async showAddModal(preselectedEmpId) {
         const empOptions = this.employees.map(e => {
             const sel = String(e.player_id) === String(preselectedEmpId) ? 'selected' : '';
             return `<option value="${e.player_id}" ${sel}>${e.name}</option>`;
         }).join('');
+
+        const allAllocations = await DB.getAll('train_fund_allocations') || [];
 
         const html = `
             <div class="p-6">
@@ -1175,9 +1528,10 @@ window.TrainingPage = {
                             <option value="paid">paid (付费)</option>
                         </select>
                     </div>
+                    <div id="modal-fund-select-container" style="display:none;"></div>
                     <div>
                         <label class="text-gray-400 text-sm mb-1 block">已付金额 ($)</label>
-                        <input type="number" min="0" class="input" id="modal-amount-input" value="0" />
+                        <input type="text" class="input money-input" id="modal-amount-input" value="0" />
                     </div>
                     <div class="flex justify-end gap-2 mt-6">
                         <button class="btn btn-secondary" id="modal-train-cancel">取消</button>
@@ -1188,6 +1542,21 @@ window.TrainingPage = {
         `;
 
         Utils.showModal(html);
+
+        if (preselectedEmpId) {
+            this._updateFundSelectHTML(preselectedEmpId, allAllocations, '', 'modal-fund-select', 'modal-amount-input');
+        }
+
+        document.getElementById('modal-type-select')?.addEventListener('change', (e) => {
+            const container = document.getElementById('modal-fund-select-container');
+            if (container) {
+                container.style.display = e.target.value === 'paid' ? '' : 'none';
+            }
+        });
+
+        document.getElementById('modal-emp-select')?.addEventListener('change', (e) => {
+            this._updateFundSelectHTML(e.target.value, allAllocations, '', 'modal-fund-select', 'modal-amount-input');
+        });
 
         // 取消按钮：关闭弹窗并重置表单
         document.getElementById('modal-train-cancel')?.addEventListener('click', () => {
@@ -1207,9 +1576,15 @@ window.TrainingPage = {
                 date: Utils.todayKey(),
                 week: Utils.weekKey(),
                 type: document.getElementById('modal-type-select')?.value || 'free',
-                trains_count: parseInt(document.getElementById('modal-trains-input')?.value) || 0,
+                trains_count: parseInt(document.getElementById('modal-trains-input')?.value) || 1,
                 amount_paid: Utils.parseMoneyInput(document.getElementById('modal-amount-input')?.value)
             };
+
+            const fundSelect = document.getElementById('modal-fund-select');
+            if (record.type === 'paid' && fundSelect && fundSelect.value) {
+                record.note = 'fund:' + fundSelect.value;
+            }
+
             await DB.put('training_records', record);
             Utils.toast('训练记录已保存', 'success');
             Utils.hideModal();
@@ -1220,11 +1595,11 @@ window.TrainingPage = {
     // ---- 名称筛选 ----
 
     _applyNameFilter(records) {
-        const filterValue = (this._nameFilterValue || '').trim().toLowerCase();
+        const filterValue = (this._nameFilterValue || '').trim();
         if (!filterValue) return records;
         return records.filter(r => {
-            const name = (r.player_name || '').toLowerCase();
-            return name.includes(filterValue);
+            const name = (r.player_name || '').trim();
+            return name === filterValue;
         });
     },
 
@@ -1241,12 +1616,8 @@ window.TrainingPage = {
     },
 
     _filterRecordsByNameDebounced() {
-        if (this._nameFilterDebounce) {
-            clearTimeout(this._nameFilterDebounce);
-        }
-        this._nameFilterDebounce = setTimeout(() => {
-            this._filterRecordsByName();
-        }, 300);
+        // Deprecated: kept for backwards compatibility if called from elsewhere
+        this._filterRecordsByName();
     },
 
     _rebindCheckboxes() {
@@ -1355,78 +1726,168 @@ window.TrainingPage = {
 
     async _batchSetCategory() {
         if (!this._selectedRecordIds || this._selectedRecordIds.size === 0) {
-            Utils.toast('请先选择要设置分类的记录', 'warning');
+            Utils.toast('请先选择要编辑的记录', 'warning');
             return;
         }
-        const count = this._selectedRecordIds.size;
 
-        const categories = window.TRAIN_CATEGORIES || [];
-        const categoryOptions = categories.map(cat =>
-            `<option value="${cat.value}">${cat.label}</option>`
-        ).join('');
+        const count = this._selectedRecordIds.size;
+        const selectedRecs = [];
+        for (const id of this._selectedRecordIds) {
+            const rec = await DB.get('training_records', id) || this.records.find(r => r.id === id);
+            if (rec) selectedRecs.push(rec);
+        }
+
+        // Group by employee
+        const empGroups = {};
+        for (const rec of selectedRecs) {
+            const pid = rec.player_id || 'unknown';
+            if (!empGroups[pid]) {
+                empGroups[pid] = {
+                    name: rec.player_name || 'Unknown',
+                    records: [],
+                    player_id: pid
+                };
+            }
+            empGroups[pid].records.push(rec);
+        }
+
+        const allAllocations = await DB.getAll('train_fund_allocations') || [];
+
+        let rowsHTML = '';
+        for (const pid in empGroups) {
+            const group = empGroups[pid];
+            const recCount = group.records.length;
+            const empName = group.name;
+            const selectId = `batch-fund-select-${pid}`;
+            const amountId = `batch-amount-${pid}`;
+            
+            // Assume default values based on the first record
+            const firstRec = group.records[0];
+            const defType = firstRec.type || 'free';
+            const defAmount = firstRec.amount_paid || 0;
+
+            rowsHTML += `
+                <div class="bg-torn-surface p-3 rounded mb-3 border border-torn-border batch-emp-group" data-emp="${pid}">
+                    <div class="font-bold text-white mb-2">${empName} <span class="text-xs text-gray-400 font-normal">(${recCount} 条记录)</span></div>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div>
+                            <label class="text-gray-400 text-sm mb-1 block">类型</label>
+                            <select class="input batch-type-select" data-emp="${pid}">
+                                <option value="free" ${defType === 'free' ? 'selected' : ''}>free (免费)</option>
+                                <option value="paid" ${defType === 'paid' ? 'selected' : ''}>paid (付费)</option>
+                            </select>
+                        </div>
+                        <div id="batch-fund-select-${pid}-container" style="${defType === 'paid' ? '' : 'display:none;'}">
+                            <!-- Fund select will be injected here -->
+                        </div>
+                        <div>
+                            <label class="text-gray-400 text-sm mb-1 block">已付金额 ($) <span class="text-xs text-gray-500">(每条)</span></label>
+                            <input type="text" class="input money-input batch-amount-input" id="${amountId}" data-emp="${pid}" value="${defAmount}" />
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
 
         const html = `
-            <div class="p-6">
+            <div class="p-6 w-[800px] max-w-[90vw]">
                 <h3 class="text-lg font-bold text-white mb-4">
-                    <i class="fas fa-folder mr-2 text-torn-accent"></i>批量设置训练分类
+                    <i class="fas fa-edit mr-2 text-torn-accent"></i>批量编辑记录
                 </h3>
-                <p class="text-gray-300 mb-4">将为选中的 <span class="text-torn-accent font-bold">${count}</span> 条记录设置分类：</p>
-                <div class="mb-4">
-                    <label class="text-gray-400 text-sm mb-1 block">训练分类</label>
-                    <select class="input" id="batch-category-select">
-                        ${categoryOptions}
-                    </select>
+                <p class="text-gray-300 mb-4">将为选中的 <span class="text-torn-accent font-bold">${count}</span> 条记录按员工批量设置：</p>
+                <div class="max-h-[60vh] overflow-y-auto pr-2">
+                    ${rowsHTML}
                 </div>
                 <div class="flex justify-end gap-2 mt-6">
-                    <button class="btn btn-secondary" id="batch-category-cancel">取消</button>
-                    <button class="btn btn-primary" id="batch-category-confirm">确认设置</button>
+                    <button class="btn btn-secondary" id="batch-edit-cancel">取消</button>
+                    <button class="btn btn-primary" id="batch-edit-confirm">确认设置</button>
                 </div>
             </div>
         `;
+        
         Utils.showModal(html);
 
-        document.getElementById('batch-category-cancel')?.addEventListener('click', () => {
+        // Inject fund selects and bind events
+        for (const pid in empGroups) {
+            const firstRec = empGroups[pid].records[0];
+            const selectId = `batch-fund-select-${pid}`;
+            const amountId = `batch-amount-${pid}`;
+            this._updateFundSelectHTML(pid, allAllocations, firstRec.note, selectId, amountId);
+        }
+
+        // Toggle fund container display when type changes
+        const modalContent = document.getElementById('modal-content');
+        if (modalContent) {
+            modalContent.addEventListener('change', (e) => {
+                if (e.target.classList.contains('batch-type-select')) {
+                    const pid = e.target.dataset.emp;
+                    const container = document.getElementById(`batch-fund-select-${pid}-container`);
+                    if (container) {
+                        container.style.display = e.target.value === 'paid' ? 'block' : 'none';
+                    }
+                }
+            });
+        }
+
+        document.getElementById('batch-edit-cancel')?.addEventListener('click', () => {
             Utils.hideModal();
         });
 
-        document.getElementById('batch-category-confirm')?.addEventListener('click', async () => {
-            const category = document.getElementById('batch-category-select')?.value;
-            if (!category) {
-                Utils.toast('请选择训练分类', 'warning');
-                return;
+        document.getElementById('batch-edit-confirm')?.addEventListener('click', async () => {
+            // Collect settings per employee
+            const settings = {};
+            for (const pid in empGroups) {
+                const typeSelect = document.querySelector(`.batch-type-select[data-emp="${pid}"]`);
+                const amountInput = document.querySelector(`.batch-amount-input[data-emp="${pid}"]`);
+                const fundSelect = document.getElementById(`batch-fund-select-${pid}`);
+                
+                settings[pid] = {
+                    type: typeSelect ? typeSelect.value : 'free',
+                    amount: amountInput ? Utils.parseMoneyInput(amountInput.value) || 0 : 0,
+                    fundId: fundSelect ? fundSelect.value : ''
+                };
             }
 
             Utils.hideModal();
-            Utils.showLoading('正在批量设置分类...');
+            Utils.showLoading('正在批量编辑...');
             try {
                 let updated = 0;
                 let failed = 0;
-                for (const id of this._selectedRecordIds) {
+                for (const rec of selectedRecs) {
                     try {
-                        const record = await DB.get('training_records', id);
+                        const pid = rec.player_id;
+                        const set = settings[pid];
+                        if (!set) continue;
+
+                        const record = await DB.get('training_records', rec.id);
                         if (record) {
-                            record.type = category;
+                            record.type = set.type;
+                            record.amount_paid = set.amount;
+                            if (set.type === 'paid' && set.fundId) {
+                                record.note = 'fund:' + set.fundId;
+                            } else {
+                                record.note = 'api_sync'; // Reset to api_sync if not fund
+                            }
                             await DB.put('training_records', record);
                             updated++;
                         } else {
                             failed++;
-                            console.warn(`[TrainingPage] Record not found for batch category update: ${id}`);
                         }
                     } catch (e) {
                         failed++;
-                        console.warn(`[TrainingPage] Failed to update category for record ${id}:`, e.message);
+                        console.warn(`[TrainingPage] Failed to update record ${rec.id}:`, e.message);
                     }
                 }
                 this._selectedRecordIds = new Set();
                 Utils.hideLoading();
                 const msg = failed > 0
-                    ? `已更新 ${updated} 条记录的分类，${failed} 条失败`
-                    : `已更新 ${updated} 条记录的分类`;
+                    ? `已更新 ${updated} 条记录，${failed} 条失败`
+                    : `已更新 ${updated} 条记录`;
                 Utils.toast(msg, updated > 0 ? 'success' : 'warning');
                 await this.render();
             } catch (e) {
                 Utils.hideLoading();
-                Utils.toast(`批量设置分类失败: ${e.message}`, 'error');
+                Utils.toast(`批量编辑失败: ${e.message}`, 'error');
             }
         });
     }

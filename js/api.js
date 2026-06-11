@@ -73,15 +73,15 @@ const TornAPI = {
   async getCompanyStock() { return this.v2('/company/stock'); },
   async getCompanyApplications() { return this.v2('/company/applications'); },
   async getCompanyDetailed() { return this.v1('detailed'); },
-  async getCompanyNews() { return this.v1('news', 'company', 'limit=100'); },
   async getUserBasic() { return this.v1('basic', 'user'); },
   async getUserEvents() { return this.v1('events', 'user'); },
   async getUserLog(offset = 0) { return this.v1('log', 'user', `offset=${offset}`); },
   async getUserLogForTarget(target) { return this.v1('log', 'user', `target=${target}`); },
   async getUserLogByTypes(logIds, limit = 100) { return this.v2(`/user/log?log=${logIds}&limit=${limit}`); },
   async getCompanyTypes() { return this.v1('companies', 'torn'); },
-  async getPlayerProfile(id) { return this.v1('profile,basic', 'user', `id=${id}`); },
-  async getPlayerEvents(id) { return this.v1('events', 'user', `id=${id}`); },
+  async getPlayerProfile(id) { return this.v1('profile,basic', `user/${id}`); },
+  async getPlayerEvents(id) { return this.v1('events', `user/${id}`); },
+  async getUserEducation() { return this.v2('/user/education'); },
 
   // Cache for player names to reduce API calls
   _playerCache: {},
@@ -109,8 +109,57 @@ const TornAPI = {
 
   async getPlayerPersonalStats(playerId) {
     const id = String(playerId);
-    const data = await this.v1('personalstats', 'user', `id=${id}`);
-    return data?.personalstats || {};
+    try {
+      const [profileData, statsData] = await Promise.all([
+        this.v2(`/user/${id}?selections=profile`),
+        this.v2(`/user/${id}/personalstats?stat=xantaken,useractivity`)
+      ]);
+      const profile = profileData?.profile || profileData || {};
+      const rawPs = statsData?.personalstats;
+      const ps = {};
+      if (Array.isArray(rawPs)) {
+        rawPs.forEach(item => {
+          if (item && item.name) {
+            ps[item.name] = item.value;
+          }
+        });
+      } else if (rawPs && typeof rawPs === 'object') {
+        Object.assign(ps, rawPs);
+      }
+      return {
+        ...ps,
+        age: profile.age || 0,
+        days_old: profile.age || 0,
+        useractivity: ps.useractivity || 0
+      };
+    } catch (e) {
+      console.warn(`[TornAPI] getPlayerPersonalStats failed for ${id}:`, e.message);
+      throw e;
+    }
+  },
+
+  async getPlayerRehabBackupStats(playerId) {
+    const id = String(playerId);
+    try {
+      const data = await this.v2(`/user/${id}/personalstats?stat=switravel,rehabs,xantaken`);
+      const rawPs = data?.personalstats;
+      const ps = { switravel: 0, rehabs: 0, xantaken: 0 };
+      if (Array.isArray(rawPs)) {
+        rawPs.forEach(item => {
+          if (item && item.name) {
+            ps[item.name] = Number(item.value) || 0;
+          }
+        });
+      } else if (rawPs && typeof rawPs === 'object') {
+        if (rawPs.switravel !== undefined) ps.switravel = Number(rawPs.switravel) || 0;
+        if (rawPs.rehabs !== undefined) ps.rehabs = Number(rawPs.rehabs) || 0;
+        if (rawPs.xantaken !== undefined) ps.xantaken = Number(rawPs.xantaken) || 0;
+      }
+      return ps;
+    } catch (e) {
+      console.warn(`[TornAPI] getPlayerRehabBackupStats failed for ${id}:`, e.message);
+      throw e;
+    }
   },
 
   /** 从 HoF 响应解析 workstats（工作属性）总值，与战斗属性无关 */
@@ -119,8 +168,8 @@ const TornAPI = {
 
     if (Array.isArray(hofData)) {
       const row = hofData.find((r) => {
-        const key = String(r.id || r.category || r.name || '').toLowerCase().replace(/\s+/g, '');
-        return key === 'workstats' || key === 'work_stats' || key === 'workingstats';
+        const key = String(r.id || r.category || r.name || '').toLowerCase().replace(/[\s_]+/g, '');
+        return key === 'workstats' || key === 'workingstats';
       });
       if (row) {
         const v = Number(row.value ?? row.score ?? row.total);
@@ -128,7 +177,7 @@ const TornAPI = {
       }
     }
 
-    const ws = hofData.workstats ?? hofData.work_stats ?? hofData['work stats'];
+    const ws = hofData.working_stats ?? hofData.workstats ?? hofData.work_stats ?? hofData['work stats'];
     if (ws == null) return null;
     if (typeof ws === 'number' && !Number.isNaN(ws)) return ws;
     if (typeof ws === 'object') {
@@ -145,12 +194,9 @@ const TornAPI = {
       const data = await this.v2(`/user/${id}?selections=hof`);
       const v = this._parseHofWorkstatsTotal(data?.hof);
       if (v != null) return v;
-    } catch (e) { /* v2 → v1 */ }
-    try {
-      const data = await this.v1('hof', 'user', `id=${id}`);
-      const v = this._parseHofWorkstatsTotal(data?.halloffame ?? data?.hof);
-      if (v != null) return v;
-    } catch (e) { /* ignore */ }
+    } catch (e) {
+      console.warn(`[TornAPI] getPlayerTotalStats failed for ${id}:`, e.message);
+    }
     return null;
   },
 
@@ -223,113 +269,6 @@ const TornAPI = {
       if (items.length) return items;
       throw new Error('No stock data from V1');
     }
-  },
-
-  /**
-   * 从公司新闻统计每位员工训练次数（v1 company/?selections=news）。
-   * 新闻格式示例："... XID=123>Name</a> has been trained by the director"
-   * @param {object} newsResponse - getCompanyNews() 返回值
-   * @param {number} sinceMs - 仅统计此时间戳（毫秒）之后的新闻
-   * @returns {Record<string, number>} player_id -> 训练次数
-   */
-  parseTrainingCountsFromNews(newsResponse, sinceMs) {
-    const counts = {};
-    const news = newsResponse?.news || newsResponse?.company_news || {};
-    const entries = Array.isArray(news) ? news : Object.values(news);
-    const sinceSec = Math.floor((sinceMs || 0) / 1000);
-    const trainedRe = /has been trained\b/i;
-    const xidRe = /XID=(\d+)/i;
-
-    for (const item of entries) {
-      const text = (item?.news || item?.text || '').toString();
-      if (!trainedRe.test(text)) continue;
-      const ts = Number(item?.timestamp || item?.time || 0);
-      if (sinceSec > 0 && ts > 0 && ts < sinceSec) continue;
-      const m = text.match(xidRe);
-      if (!m) continue;
-      const pid = String(m[1]);
-      counts[pid] = (counts[pid] || 0) + 1;
-    }
-    return counts;
-  },
-
-  /**
-   * 从公司新闻 API 响应中解析训练条目（结构化数据，用于写入 training_records）。
-   * 与 parseTrainingCountsFromNews 不同，此方法返回完整的条目数组而非仅计数。
-   * 每条新闻格式示例：
-   *   "Store Manager <a href=profiles.php?XID=2226394>Young-Saucekage</a> has been trained by the director"
-   * @param {object} newsResponse - getCompanyNews() 返回值
-   * @param {number} sinceMs - 仅解析此时间戳（毫秒）之后的新闻
-   * @returns {Array<{playerId:string, playerName:string, date:string, timestamp:number, newsId:string}>}
-   */
-  parseTrainingEntriesFromNews(newsResponse, sinceMs) {
-    const entries = [];
-    const news = newsResponse?.news || newsResponse?.company_news || {};
-    const newsList = Array.isArray(news) ? news : Object.entries(news).map(([id, item]) => ({ ...item, _newsId: id }));
-    const sinceSec = Math.floor((sinceMs || 0) / 1000);
-    const trainedRe = /has been trained\b/i;
-    const xidRe = /XID=(\d+)/i;
-    const nameRe = /<a[^>]*>([^<]+)<\/a>/i;
-
-    for (const item of newsList) {
-      const text = (item?.news || item?.text || '').toString();
-      if (!trainedRe.test(text)) continue;
-
-      const ts = Number(item?.timestamp || item?.time || 0);
-      if (sinceSec > 0 && ts > 0 && ts < sinceSec) continue;
-
-      const xidMatch = text.match(xidRe);
-      if (!xidMatch) continue;
-
-      const nameMatch = text.match(nameRe);
-      const playerName = nameMatch ? nameMatch[1].trim() : '';
-
-      // 解析日期：timestamp 是 Unix 秒
-      const dateObj = ts > 0 ? new Date(ts * 1000) : new Date();
-      const dateStr = dateObj.toISOString().slice(0, 10); // YYYY-MM-DD
-
-      entries.push({
-        playerId: String(xidMatch[1]),
-        playerName: playerName,
-        date: dateStr,
-        timestamp: ts,
-        newsId: item._newsId || String(item.id || ''),
-        rawText: text.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
-      });
-    }
-    return entries;
-  },
-
-  /**
-   * @deprecated 使用本地 training_records 数据库计算总和。由于 Torn API 仅返回 25 条记录限制，此方法不再用于展示面板。
-   */
-  async getWeeklyEmployeeTrainCounts() {
-    const sinceMs = Utils.weekDateRange(Utils.weekKey()).start.getTime();
-    const data = await this.getCompanyNews();
-    const counts = this.parseTrainingCountsFromNews(data, sinceMs);
-    const totalEntries = Object.values(data?.news || data?.company_news || {}).length;
-    console.log(`[TornAPI] getWeeklyEmployeeTrainCounts: ${totalEntries} news entries returned (Torn API limits to ~25, no pagination). Parsed ${Object.keys(counts).length} employees with training counts.`);
-    if (totalEntries >= 25) {
-      console.warn('[TornAPI] getWeeklyEmployeeTrainCounts: API returned max ~25 entries. Data may be incomplete for the full week. Use local training_records as primary source.');
-    }
-    return counts;
-  },
-
-  /**
-   * @deprecated 推荐使用 v2 `/user/log` 接口获取完整训练数据。由于 Torn API 仅返回 25 条记录限制，此方法可能会截断数据。
-   * @returns {{ entries: Array, totalNewsCount: number }}
-   */
-  async getWeeklyTrainingEntries() {
-    const sinceMs = Utils.weekDateRange(Utils.weekKey()).start.getTime();
-    const data = await this.getCompanyNews();
-    const newsList = data?.news || data?.company_news || {};
-    const totalNewsCount = Array.isArray(newsList) ? newsList.length : Object.keys(newsList).length;
-    const entries = this.parseTrainingEntriesFromNews(data, sinceMs);
-    console.log(`[TornAPI] getWeeklyTrainingEntries: ${totalNewsCount} total news, ${entries.length} training entries parsed.`);
-    if (totalNewsCount >= 25) {
-      console.warn('[TornAPI] getWeeklyTrainingEntries: API returned max ~25 entries. Data may be incomplete.');
-    }
-    return { entries, totalNewsCount };
   },
 
   /**

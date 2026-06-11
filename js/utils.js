@@ -1,17 +1,25 @@
 // Utility functions
 const Utils = {
-  // Format money with commas
+  // Format money with commas (compact in popup mode: round down to millions, 1 decimal place)
   formatMoney(n) {
     if (n == null) return '-';
-    return '$' + Number(n).toLocaleString();
+    const num = Number(n);
+    if (isNaN(num)) return '-';
+    if (document.documentElement.classList.contains('is-popup') && num >= 1e6) {
+      const millions = Math.round(num / 1e6);
+      return '$' + millions + 'm';
+    }
+    return '$' + Math.round(num).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
   },
 
   // Format number with k/m suffix
   formatShort(n) {
     if (n == null) return '-';
-    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-    return n.toString();
+    const num = Number(n);
+    if (isNaN(num)) return '-';
+    if (num >= 1e6) return Math.round(num / 1e6) + 'M';
+    if (num >= 1e3) return Math.round(num / 1e3) + 'K';
+    return Math.round(num).toString();
   },
 
   /** 属性值等：≥1000 显示为 k 近似 */
@@ -19,7 +27,7 @@ const Utils = {
     if (n == null || n === '' || Number.isNaN(Number(n))) return '-';
     const num = Number(n);
     if (Math.abs(num) >= 1000) return this.formatShort(num);
-    return num.toLocaleString();
+    return Math.round(num).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
   },
 
   formatPosition(position) {
@@ -30,23 +38,17 @@ const Utils = {
     return String(position);
   },
 
-  COMPANY_TYPE_NAMES: {
-    1: '花店', 2: '甜甜圈店', 3: '肉店', 4: '蜡烛店', 5: '餐厅',
-    6: '软件公司', 7: '建筑公司', 8: '律所', 9: '汽车经销商', 10: '杂货店',
-    11: '服装店', 12: '茶馆', 13: '游戏店', 14: '制药公司', 15: '农业公司',
-    16: '物流公司', 17: '采矿公司', 18: '安保公司', 19: '健身中心', 20: '洗车店',
-    21: '商场', 22: '加油站', 23: '夜总会', 24: '成人用品店', 25: '眼镜店',
-    26: '动物园', 27: '宠物店', 28: '珠宝店', 29: '蔬菜摊', 30: '家具店',
-    31: '音乐店', 32: '房地产公司', 33: '回收中心', 34: '殡仪馆', 35: '博物馆',
-    36: '电视台', 37: '烟草店', 38: '玩具店', 39: '书店', 40: '旅行公司',
-    41: '炼油厂', 42: '鞋店', 43: '五金店', 44: '美容院',
-    45: '美食超市', 46: '数码店', 47: '维修店', 48: '码头'
+  // 公司类型名回退：优先使用 API 缓存，其次使用 COMPANY_JOBS 的英文名
+  _getCompanyTypeFallbackName(id) {
+    const jobs = window.COMPANY_JOBS;
+    if (jobs && jobs[id]) return jobs[id].company_name;
+    return `类型 ${id}`;
   },
 
   async cacheCompanyTypesFromAPI() {
     try {
       const existing = await DB.getAll('company_types');
-      if (existing && existing.length >= 40) return;
+      if (existing && existing.length >= Object.keys(window.COMPANY_JOBS || {}).length) return;
       const data = await TornAPI.getCompanyTypes();
       const companies = data?.companies || data?.company_types || data?.torn?.companies || {};
       const entries = Array.isArray(companies) ? companies : Object.entries(companies);
@@ -82,7 +84,7 @@ const Utils = {
       const row = await DB.get('company_types', id);
       if (row?.name) return row.name;
     } catch (e) { /* ignore */ }
-    return this.COMPANY_TYPE_NAMES[id] || `类型 ${id}`;
+    return this._getCompanyTypeFallbackName(id);
   },
 
   /**
@@ -183,9 +185,9 @@ const Utils = {
   },
 
   // Format percentage
-  formatPct(n, decimals = 1) {
+  formatPct(n, decimals = 0) {
     if (n == null) return '-';
-    return n.toFixed(decimals) + '%';
+    return Math.round(n).toFixed(decimals) + '%';
   },
 
   // Unix timestamp to local date string
@@ -219,9 +221,15 @@ const Utils = {
     return Math.floor((Date.now() / 1000 - ts) / 86400);
   },
 
-  // Get today's date key (YYYY-MM-DD)
+  // Get today's date key (YYYY-MM-DD) - aligned to the UTC 18:00 company daily reset (Torn game time)
   todayKey() {
-    return new Date().toISOString().slice(0, 10);
+    const now = new Date();
+    const updateUTC = new Date(now);
+    updateUTC.setUTCHours(18, 0, 0, 0);
+    if (updateUTC > now) {
+      updateUTC.setUTCDate(updateUTC.getUTCDate() - 1);
+    }
+    return updateUTC.toISOString().slice(0, 10);
   },
 
   // 周一 00:00（本地）作为一周起点
@@ -291,7 +299,7 @@ const Utils = {
       let status;
       if (row.is_written_off === true) {
         status = 'writeoff';
-      } else if (taxAmt > 0 && paidAmt >= taxAmt) {
+      } else if (paidAmt >= taxAmt) {
         status = 'paid';
       } else if (paidAmt <= 0) {
         status = 'unpaid';
@@ -339,9 +347,15 @@ const Utils = {
     }
   },
 
-  // Format currency without decimals ($1,234)
+  // Format currency without decimals ($1,234) (compact in popup mode: round down to millions, 1 decimal place)
   formatCurrency(amount) {
-    return '$' + Number(amount).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+    const num = Number(amount);
+    if (isNaN(num)) return '-';
+    if (document.documentElement.classList.contains('is-popup') && num >= 1e6) {
+      const millions = Math.round(num / 1e6);
+      return '$' + millions + 'm';
+    }
+    return '$' + Math.round(num).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
   },
 
   // Debounce
@@ -356,9 +370,12 @@ const Utils = {
   // Color for effectiveness value
   effColor(val, max = 100) {
     const pct = val / max;
-    if (pct >= 0.8) return '#4ade80';
-    if (pct >= 0.5) return '#facc15';
-    return '#ef4444';
+    if (pct > 1.8) return '#f5a623'; // Gold for > 180%
+    if (pct > 1.5) return '#c084fc'; // Purple for > 150%
+    if (pct > 1.0) return '#38bdf8'; // Blue for > 100%
+    if (pct >= 0.8) return '#4ade80'; // Green
+    if (pct >= 0.5) return '#facc15'; // Yellow
+    return '#ef4444'; // Red
   },
 
   // Color for addiction
@@ -396,9 +413,9 @@ const Utils = {
   dailyXanFromPersonalStats(ps) {
     if (!ps) return null;
     const taken = Number(ps.xantaken ?? ps.xanaxtaken ?? ps.xanax) || 0;
-    const days = Number(ps.daysold ?? ps.days_old) || 0;
+    const days = Number(ps.daysold ?? ps.days_old ?? ps.age) || 0;
     if (days > 0) return taken / days;
-    const activity = Number(ps.useractivitytime) || 0;
+    const activity = Number(ps.useractivitytime ?? ps.useractivity) || 0;
     if (activity > 0) return taken / Math.max(1, activity / 86400);
     return taken > 0 ? taken : null;
   },
@@ -442,7 +459,7 @@ const Utils = {
     for (const seller of sellers) {
       const pid = String(seller.player_id);
       const sellerTxs = txs.filter((t) => String(t.player_id) === pid);
-      seller.points_used = sellerTxs.length * 250;
+      seller.points_used = sellerTxs.length * BOOST_POINTS_PER_USE;
       if (sellerTxs.length) {
         let latest = 0;
         for (const tx of sellerTxs) {
@@ -544,17 +561,22 @@ const Utils = {
   },
 
   // Show modal
-  showModal(content) {
+  showModal(content, sizeClass = 'max-w-lg') {
     const overlay = document.getElementById('modal-overlay');
     const container = document.getElementById('modal-content');
     container.innerHTML = '';
+    // Reset and apply size class
+    container.className = `bg-torn-card rounded-xl border border-torn-border w-full max-h-[80vh] overflow-y-auto ${sizeClass}`;
     if (typeof content === 'string') container.innerHTML = content;
     else container.appendChild(content);
+    container.scrollTop = 0; // Reset scroll position to top
     overlay.classList.remove('hidden');
     overlay.classList.add('flex');
   },
   hideModal() {
     const overlay = document.getElementById('modal-overlay');
+    const container = document.getElementById('modal-content');
+    if (container) container.scrollTop = 0; // Reset scroll position on hide
     overlay.classList.add('hidden');
     overlay.classList.remove('flex');
   },
