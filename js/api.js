@@ -82,6 +82,9 @@ const TornAPI = {
   async getPlayerProfile(id) { return this.v1('profile,basic', `user/${id}`); },
   async getPlayerEvents(id) { return this.v1('events', `user/${id}`); },
   async getUserEducation() { return this.v2('/user/education'); },
+  async getIndustryCompanies(industryId, offset = 0, limit = 100) {
+    return this.v2(`/company/${industryId}/companies?limit=${limit}&offset=${offset}&striptags=false`);
+  },
 
   // Cache for player names to reduce API calls
   _playerCache: {},

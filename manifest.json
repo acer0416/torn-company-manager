@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Torn Company Manager",
   "default_locale": "zh_CN",
-  "version": "1.0.0",
-  "description": "Torn City 公司管理工具 - 员工、训练、库存、财务、毒瘾监控、Boost管理",
+  "version": "1.1.0",
+  "description": "Torn City 公司管理工具 - 员工、训练、库存、财务、毒瘾监控、Boost管理、行业分析",
   "permissions": [
     "storage",
     "alarms",
@@ -14,12 +14,6 @@
     "https://www.torn.com/*",
     "https://yata.yt/*"
   ],
-  "browser_specific_settings": {
-    "gecko": {
-      "id": "torn-company-manager@hermes",
-      "strict_min_version": "109.0"
-    }
-  },
   "action": {
     "default_popup": "popup/index.html",
     "default_icon": {

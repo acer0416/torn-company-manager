@@ -31,6 +31,22 @@ window.TrainingPlannerPage = (() => {
   }
 
   /**
+   * 平滑效率计算（不 floor），用于规划器计算边际改进量
+   */
+  function calculateEfficiencySmooth(pStat, pReq, sStat, sReq) {
+    try {
+      const pBase = pReq > 0 ? Math.min(45, (pStat / pReq) * 45) : 0;
+      const sBase = sReq > 0 ? Math.min(45, (sStat / sReq) * 45) : 0;
+      const mult = _hasBus2110 ? BUS2110_EFFICIENCY_MULTIPLIER : 1.0;
+      const pBonus = (pStat > pReq && pReq > 0) ? 5 * Math.log2((pStat / pReq) * mult) : 0;
+      const sBonus = (sStat > sReq && sReq > 0) ? 5 * Math.log2((sStat / sReq) * mult) : 0;
+      return pBase + sBase + pBonus + sBonus;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
    * 模拟训练后的属性变化
    */
   function simulateTrain(stats, gainPrimaryStat, gainSecondaryStat) {
@@ -38,6 +54,20 @@ window.TrainingPlannerPage = (() => {
     if (gainPrimaryStat in newStats) newStats[gainPrimaryStat] += TRAIN_PRIMARY_BONUS;
     if (gainSecondaryStat in newStats) newStats[gainSecondaryStat] += TRAIN_SECONDARY_BONUS;
     return newStats;
+  }
+
+  /**
+   * 计算理论最高效能（去除负面削减，settled_in 设为 10）
+   */
+  function _calcTheoreticalMaxEffectiveness(emp) {
+    const eff = emp.effectiveness_detail || {};
+    const working_stats = eff.working_stats ?? 0;
+    const settled_in = 10;
+    const book = eff.book ?? 0;
+    const merits = eff.merits ?? 0;
+    const director_education = eff.director_education ?? 0;
+    const management = eff.management ?? 0;
+    return working_stats + settled_in + book + merits + director_education + management;
   }
 
   /**
@@ -57,6 +87,10 @@ window.TrainingPlannerPage = (() => {
       currentStats[targetJob.primary_req_stat], targetJob.primary_req_value,
       currentStats[targetJob.secondary_req_stat], targetJob.secondary_req_value
     );
+    const currentEffSmooth = calculateEfficiencySmooth(
+      currentStats[targetJob.primary_req_stat], targetJob.primary_req_value,
+      currentStats[targetJob.secondary_req_stat], targetJob.secondary_req_value
+    );
 
     const currentPosition = emp.position || '';
     let bestJobName = null;
@@ -69,7 +103,11 @@ window.TrainingPlannerPage = (() => {
         newStats[targetJob.primary_req_stat], targetJob.primary_req_value,
         newStats[targetJob.secondary_req_stat], targetJob.secondary_req_value
       );
-      const improvement = newEff - currentEff;
+      const newEffSmooth = calculateEfficiencySmooth(
+        newStats[targetJob.primary_req_stat], targetJob.primary_req_value,
+        newStats[targetJob.secondary_req_stat], targetJob.secondary_req_value
+      );
+      const improvement = newEffSmooth - currentEffSmooth;
       allResults.push({
         jobName: job.name,
         primaryGain: job.primary_gain_stat,
@@ -97,23 +135,22 @@ window.TrainingPlannerPage = (() => {
       for (let i = 0; i < 10; i++) {
         stats10 = simulateTrain(stats10, bestJob.primary_gain_stat, bestJob.secondary_gain_stat);
       }
-      const eff10 = calculateEfficiency(
+      const eff10Smooth = calculateEfficiencySmooth(
         stats10[targetJob.primary_req_stat], targetJob.primary_req_value,
         stats10[targetJob.secondary_req_stat], targetJob.secondary_req_value
       );
-      improvement10 = eff10 - currentEff;
+      improvement10 = eff10Smooth - currentEffSmooth;
 
-      // 计算多少次训练后效率增加 1 点（相对当前效率，保留小数）
-      // 例如当前效率 75.3，目标 76.3
-      const targetEff = currentEff + 1.0;
+      // 计算多少次训练后效率增加 1 点（平滑值）
+      const targetEff = currentEffSmooth + 1.0;
       let statsN = { ...currentStats };
       for (let n = 1; n <= 10000; n++) {
         statsN = simulateTrain(statsN, bestJob.primary_gain_stat, bestJob.secondary_gain_stat);
-        const effN = calculateEfficiency(
+        const effNSmooth = calculateEfficiencySmooth(
           statsN[targetJob.primary_req_stat], targetJob.primary_req_value,
           statsN[targetJob.secondary_req_stat], targetJob.secondary_req_value
         );
-        if (effN >= targetEff - 1e-6) {
+        if (effNSmooth >= targetEff - 1e-6) {
           trainingsForPlus1 = n;
           break;
         }
@@ -143,11 +180,22 @@ window.TrainingPlannerPage = (() => {
   }
 
   function _formatEff(v) {
-    return typeof v === 'number' && !isNaN(v) ? v.toFixed(2) : 'N/A';
+    return typeof v === 'number' && !isNaN(v) ? Math.round(v) : 'N/A';
   }
 
   function _formatImprovement(v) {
-    return typeof v === 'number' && v > -999 ? `+${v.toFixed(2)}` : 'N/A';
+    if (typeof v !== 'number' || v <= -999) return 'N/A';
+    if (v === 0) return '+0.00';
+    if (Math.abs(v) < 0.01) return `+${v.toFixed(4)}`;
+    if (Math.abs(v) < 1) return `+${v.toFixed(2)}`;
+    return `+${v.toFixed(2)}`;
+  }
+
+  function _formatSummaryValue(v) {
+    if (typeof v !== 'number' || isNaN(v)) return '0';
+    if (v === 0) return '0';
+    if (Math.abs(v) < 0.01) return v.toFixed(4);
+    return v.toFixed(2);
   }
 
   function _formatTrainingCount(v) {
@@ -191,10 +239,11 @@ window.TrainingPlannerPage = (() => {
         player_id: String(r.player_id),
         name: r.name || `ID:${r.player_id}`,
         position: r.position || '',
-        manual_labor: r.stats?.manual_labor || 0,
-        intelligence: r.stats?.intelligence || 0,
-        endurance: r.stats?.endurance || 0,
+        manual_labor: r.stats?.manual_labor ?? r.manual_labor ?? 0,
+        intelligence: r.stats?.intelligence ?? r.intelligence ?? 0,
+        endurance: r.stats?.endurance ?? r.endurance ?? 0,
         effectiveness: r.effectiveness || 0,
+        effectiveness_detail: r.effectiveness_detail || {},
       }));
 
       console.log(`[TrainingPlanner] 从 DB 加载 ${_employees.length} 名员工 (日期: ${latestDate})`);
@@ -233,9 +282,9 @@ window.TrainingPlannerPage = (() => {
           wage: e.wage || 0,
           status: e.status?.state || '',
           stats: {
-            manual_labor: parseInt(e.manual_labor) || 0,
-            intelligence: parseInt(e.intelligence) || 0,
-            endurance: parseInt(e.endurance) || 0
+            manual_labor: parseInt(e.stats?.manual_labor ?? e.manual_labor) || 0,
+            intelligence: parseInt(e.stats?.intelligence ?? e.intelligence) || 0,
+            endurance: parseInt(e.stats?.endurance ?? e.endurance) || 0
           },
           effectiveness_detail: typeof e.effectiveness === 'object' ? e.effectiveness : {}
         });
@@ -318,6 +367,8 @@ window.TrainingPlannerPage = (() => {
       const improvement10 = plan ? plan.improvement10 : null;
       const trainingsForPlus1 = plan ? plan.trainingsForPlus1 : null;
       const currentEff = plan ? plan.currentEff : null;
+      const targetJobName = plan?.targetJobName || posName;
+      const maxEff = _calcTheoreticalMaxEffectiveness(emp);
 
       return `<tr class="border-t border-torn-border/50 hover:bg-torn-surface/50 transition">
         <td class="px-3 py-2 text-sm">${emp.name}</td>
@@ -326,9 +377,10 @@ window.TrainingPlannerPage = (() => {
         <td class="px-3 py-2 text-xs">${_statBadge('INT', emp.intelligence || 0)}</td>
         <td class="px-3 py-2 text-xs">${_statBadge('END', emp.endurance || 0)}</td>
         <td class="px-3 py-2 text-sm text-center font-mono ${currentEff > 80 ? 'text-green-400' : currentEff > 50 ? 'text-yellow-400' : 'text-red-400'}">${_formatEff(currentEff)}</td>
+        <td class="px-3 py-2 text-sm text-center font-mono ${maxEff >= 100 ? 'text-green-400' : maxEff >= 80 ? 'text-yellow-400' : 'text-red-400'}">${maxEff}</td>
         <td class="px-3 py-2">
           <select id="tp-target-${emp.player_id}" class="tp-target-select bg-torn-surface border border-torn-border rounded px-2 py-1 text-xs text-gray-200 w-full max-w-[160px]">
-            ${jobOptions.replace(`value="${posName}"`, `value="${posName}" selected`)}
+            ${jobOptions.replace(`value="${targetJobName}"`, `value="${targetJobName}" selected`)}
           </select>
         </td>
         <td class="px-3 py-2 text-sm font-medium ${bestJob ? 'text-torn-accent' : 'text-gray-500'}">${bestJob || '—'}</td>
@@ -347,7 +399,8 @@ window.TrainingPlannerPage = (() => {
               <th class="px-3 py-2 font-medium text-left">MAN</th>
               <th class="px-3 py-2 font-medium text-left">INT</th>
               <th class="px-3 py-2 font-medium text-left">END</th>
-              <th class="px-3 py-2 font-medium text-center">当前效率</th>
+              <th class="px-3 py-2 font-medium text-center">基础效率</th>
+              <th class="px-3 py-2 font-medium text-center">理论最高</th>
               <th class="px-3 py-2 font-medium text-left">目标岗位</th>
               <th class="px-3 py-2 font-medium text-left">推荐训练</th>
               <th class="px-3 py-2 font-medium text-center">10次训练效果</th>
@@ -362,6 +415,9 @@ window.TrainingPlannerPage = (() => {
 
   function _summaryHTML() {
     if (!_planResults.length) return '';
+
+    const hasPlan = _planResults.some(p => p.bestImprovement !== null);
+    if (!hasPlan) return '';
 
     const avgImprovement = _planResults.reduce((s, p) => s + (p.bestImprovement > 0 ? p.bestImprovement : 0), 0) / _planResults.length;
     const maxImprovement = Math.max(..._planResults.map(p => p.bestImprovement || 0));
@@ -385,11 +441,11 @@ window.TrainingPlannerPage = (() => {
         <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
           <div class="bg-torn-surface rounded p-3">
             <div class="text-xs text-gray-400">平均效率提升</div>
-            <div class="text-lg font-bold text-green-400">+${avgImprovement.toFixed(4)}</div>
+            <div class="text-lg font-bold text-green-400">+${_formatSummaryValue(avgImprovement)}</div>
           </div>
           <div class="bg-torn-surface rounded p-3">
             <div class="text-xs text-gray-400">最大效率提升</div>
-            <div class="text-lg font-bold text-torn-accent">+${maxImprovement.toFixed(4)}</div>
+            <div class="text-lg font-bold text-torn-accent">+${_formatSummaryValue(maxImprovement)}</div>
             <div class="text-xs text-gray-500">${bestEmp?.empName || ''}</div>
           </div>
           <div class="bg-torn-surface rounded p-3">
@@ -455,11 +511,42 @@ window.TrainingPlannerPage = (() => {
       if (Router.currentPage !== 'training-planner') return;
       if (e.target.id === 'tp-company-type') {
         _companyTypeId = _getSelectedCompanyTypeId();
-        _planResults = []; // 清空旧规划
+        if (_employees.length) {
+          _calculateInitialEfficiencies();
+        }
         _renderTable();
         // 持久化公司类型
         if (_companyTypeId) {
           await _persistCompanyType(_companyTypeId);
+        }
+      }
+      // 目标岗位变更时重新计算该员工的基础效率
+      if (e.target.classList.contains('tp-target-select')) {
+        const empId = e.target.id.replace('tp-target-', '');
+        const emp = _employees.find(e => e.player_id === empId);
+        if (emp) {
+          const companyData = COMPANY_JOBS[_companyTypeId];
+          if (companyData) {
+            const jobMap = {};
+            companyData.jobs.forEach(j => { jobMap[j.name] = j; });
+            const targetJob = jobMap[e.target.value] || companyData.jobs[0];
+            const currentStats = {
+              MAN: emp.manual_labor || 0,
+              INT: emp.intelligence || 0,
+              END: emp.endurance || 0,
+            };
+            const currentEff = calculateEfficiency(
+              currentStats[targetJob.primary_req_stat], targetJob.primary_req_value,
+              currentStats[targetJob.secondary_req_stat], targetJob.secondary_req_value
+            );
+            const planIdx = _planResults.findIndex(p => p.empId === empId);
+            if (planIdx >= 0) {
+              _planResults[planIdx].currentEff = currentEff;
+              _planResults[planIdx].currentStats = currentStats;
+              _planResults[planIdx].targetJobName = targetJob.name;
+            }
+            _renderTable();
+          }
         }
       }
     });
@@ -510,17 +597,18 @@ window.TrainingPlannerPage = (() => {
         player_id: String(e.id || e.player_id),
         name: e.name || `ID:${e.id || e.player_id}`,
         position: e.position?.name || e.position || '',
-        manual_labor: parseInt(e.manual_labor) || 0,
-        intelligence: parseInt(e.intelligence) || 0,
-        endurance: parseInt(e.endurance) || 0,
+        manual_labor: parseInt(e.stats?.manual_labor ?? e.manual_labor) || 0,
+        intelligence: parseInt(e.stats?.intelligence ?? e.intelligence) || 0,
+        endurance: parseInt(e.stats?.endurance ?? e.endurance) || 0,
         effectiveness: typeof e.effectiveness === 'object' ? (e.effectiveness.total || 0) : (parseInt(e.effectiveness) || 0),
+        effectiveness_detail: typeof e.effectiveness === 'object' ? e.effectiveness : {},
       }));
 
       // 写入 employee_history 持久化
       await _saveToDB(data.employees || []);
 
       _dataSource = 'api';
-      _planResults = [];
+      _calculateInitialEfficiencies();
       _renderTable();
 
       // 显示规划按钮
@@ -540,6 +628,50 @@ window.TrainingPlannerPage = (() => {
   }
 
   // ---- 训练规划 ----
+
+  /**
+   * 计算每位员工基于当前岗位的初始效率（不生成规划结果，只用于显示基础效率）
+   */
+  function _calculateInitialEfficiencies() {
+    if (!_employees.length) return;
+
+    const companyData = COMPANY_JOBS[_companyTypeId];
+    if (!companyData) return;
+
+    const allJobs = companyData.jobs;
+    const jobMap = {};
+    allJobs.forEach(j => { jobMap[j.name] = j; });
+
+    _planResults = [];
+
+    for (const emp of _employees) {
+      const currentPosName = emp.position || '';
+      const targetJob = jobMap[currentPosName] || allJobs[0];
+
+      const currentStats = {
+        MAN: emp.manual_labor || 0,
+        INT: emp.intelligence || 0,
+        END: emp.endurance || 0,
+      };
+      const currentEff = calculateEfficiency(
+        currentStats[targetJob.primary_req_stat], targetJob.primary_req_value,
+        currentStats[targetJob.secondary_req_stat], targetJob.secondary_req_value
+      );
+
+      _planResults.push({
+        empId: emp.player_id,
+        empName: emp.name,
+        targetJobName: targetJob.name,
+        bestJobName: null,
+        bestImprovement: null,
+        allResults: [],
+        currentEff,
+        currentStats,
+        improvement10: null,
+        trainingsForPlus1: null,
+      });
+    }
+  }
 
   function _runPlan() {
     if (!_employees.length) {
@@ -604,7 +736,7 @@ window.TrainingPlannerPage = (() => {
       const emp = _employees.find(e => e.player_id === pr.empId);
       report += `=== 员工: ${pr.empName} | 目标岗位: ${pr.targetJobName} ===\n`;
       report += `MAN: ${pr.currentStats.MAN} | INT: ${pr.currentStats.INT} | END: ${pr.currentStats.END}\n`;
-      report += `当前效率: ${pr.currentEff.toFixed(2)}\n`;
+      report += `基础效率: ${pr.currentEff.toFixed(2)}\n`;
       report += `→ 最佳训练岗位: ${pr.bestJobName} (10次训练效果 +${(pr.improvement10 || 0).toFixed(2)}, 训练至+1效率需 ${pr.trainingsForPlus1 === Infinity ? '∞' : pr.trainingsForPlus1} 次)\n`;
       report += `\n`;
       report += `训练岗位${''.padEnd(20)}主属性   副属性   效率Δ\n`;
@@ -715,6 +847,7 @@ window.TrainingPlannerPage = (() => {
 
       if (loadedFromDB && _employees.length > 0) {
         _dataSource = 'db';
+        _calculateInitialEfficiencies();
         _renderTable();
         const planBtn = document.getElementById('tp-plan-btn');
         if (planBtn) planBtn.classList.remove('hidden');

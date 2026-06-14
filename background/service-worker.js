@@ -1,6 +1,5 @@
 // Background Service Worker - handles alarms, notifications, periodic monitoring
 // Runs independently even when popup is closed
-// Compatible with both Chrome and Firefox (uses chrome.* which both support)
 
 // Open app in new tab when extension icon is clicked
 chrome.action.onClicked.addListener(() => {
@@ -31,6 +30,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     await refreshCompanyData();
   } else if (alarm.name === 'boost-points-regen') {
     await regenerateBoostSellerPoints();
+  } else if (alarm.name === 'industry-refresh') {
+    await refreshIndustryData();
   }
 });
 
@@ -48,6 +49,17 @@ function msUntilNext2AM() {
   next.setHours(2, 0, 0, 0);
   if (next <= now) next.setDate(next.getDate() + 1);
   return next - now;
+}
+
+function msUntilBeijing2AM15() {
+  const now = new Date();
+  // Beijing = UTC+8, so 2:15 AM Beijing = 18:15 UTC previous day
+  const utcNow = now.getTime() + now.getTimezoneOffset() * 60000;
+  const utcDate = new Date(utcNow);
+  const target = new Date(utcDate);
+  target.setUTCHours(18, 15, 0, 0); // 18:15 UTC = 02:15 Beijing
+  if (target <= utcDate) target.setDate(target.getDate() + 1);
+  return target - utcDate;
 }
 
 async function setupAlarms() {
@@ -74,6 +86,12 @@ async function setupAlarms() {
 
   chrome.alarms.create('boost-points-regen', {
     delayInMinutes: Math.max(1, msUntilNext2AM() / 60000),
+    periodInMinutes: 24 * 60
+  });
+
+  // Industry data refresh: daily at 2:15 AM Beijing time (UTC+8 = 18:15 UTC)
+  chrome.alarms.create('industry-refresh', {
+    delayInMinutes: msUntilBeijing2AM15() / 60000,
     periodInMinutes: 24 * 60
   });
 }
@@ -248,10 +266,10 @@ async function recordRehabEvent(playerId, playerName) {
 }
 
 // IndexedDB helper for service worker
-// NOTE: DB version must match js/db.js DB_VERSION (currently 11)
+// NOTE: DB version must match js/db.js DB_VERSION (currently 12)
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('torn-company-manager', 11);
+    const req = indexedDB.open('torn-company-manager', 12);
     req.onupgradeneeded = (event) => {
       const db = event.target.result;
       const oldVersion = event.oldVersion;
@@ -276,6 +294,14 @@ function openDB() {
         tfaStore.createIndex('employeeId', 'employeeId', { unique: false });
         tfaStore.createIndex('weekKey', 'weekKey', { unique: false });
         tfaStore.createIndex('createdAt', 'createdAt', { unique: false });
+      }
+      // Industry companies (v12)
+      if (!db.objectStoreNames.contains('industry_companies')) {
+        const icStore = db.createObjectStore('industry_companies', { keyPath: 'CompanyID' });
+        icStore.createIndex('industry_id', 'industry_id');
+      }
+      if (!db.objectStoreNames.contains('industry_meta')) {
+        db.createObjectStore('industry_meta', { keyPath: 'key' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -317,6 +343,85 @@ try {
   }
 }
 
+// Industry company data refresh (daily at 2:15 AM Beijing time)
+async function refreshIndustryData() {
+  const { apiKey } = await chrome.storage.local.get('apiKey');
+  if (!apiKey) return;
+
+  try {
+    // Detect user's company type
+    const profileResp = await fetch(`https://api.torn.com/company/?selections=profile&key=${apiKey}`);
+    const profileData = await profileResp.json();
+    if (profileData.error) return;
+    const companyType = profileData?.company?.company_type;
+    if (!companyType) return;
+
+    // Fetch all companies in the industry
+    const allCompanies = [];
+    let offset = 0;
+    const limit = 100;
+    while (true) {
+      const resp = await fetch(`https://api.torn.com/v2/company/${companyType}/companies?limit=${limit}&offset=${offset}&striptags=false&key=${apiKey}`);
+      const data = await resp.json();
+      if (data.error) break;
+      const companies = data.companies || [];
+      allCompanies.push(...companies);
+      if (!data._metadata?.links?.next || companies.length === 0) break;
+      offset += limit;
+      await new Promise(r => setTimeout(r, 650));
+    }
+
+    if (allCompanies.length === 0) return;
+
+    // Process and store
+    const db = await openDB();
+    const tx = db.transaction(['industry_companies', 'industry_meta'], 'readwrite');
+    const icStore = tx.objectStore('industry_companies');
+    const metaStore = tx.objectStore('industry_meta');
+
+    // Clear old data for this industry
+    const idx = icStore.index('industry_id');
+    const existing = await new Promise(resolve => {
+      const req = idx.getAll(companyType);
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => resolve([]);
+    });
+    for (const row of existing) {
+      icStore.delete(row.CompanyID);
+    }
+
+    // Insert new data
+    for (const c of allCompanies) {
+      const director = c.director || {};
+      icStore.put({
+        CompanyID: c.id || 0,
+        industry_id: companyType,
+        Name: c.name || 'Unknown',
+        DirectorName: (director != null && typeof director === 'object' ? director.name : director) || 'Unknown',
+        DirectorID: (director != null && typeof director === 'object' ? (director.id ?? director.player_id) : null) || null,
+        Stars: c.rating || 0,
+        Daily_Income: c.income?.daily || 0,
+        Weekly_Income: c.income?.weekly || 0,
+        Daily_Customers: c.customers?.daily || 0,
+        Weekly_Customers: c.customers?.weekly || 0,
+        Employees_Hired: c.employees?.hired || 0,
+        Employees_Capacity: c.employees?.capacity || 0,
+        Days_Old: c.days_old || 0
+      });
+    }
+
+    metaStore.put({ key: 'last_update', value: Date.now() });
+    metaStore.put({ key: 'industry_id', value: companyType });
+    metaStore.put({ key: 'company_count', value: allCompanies.length });
+
+    await new Promise((resolve) => { tx.oncomplete = resolve; tx.onerror = resolve; });
+    db.close();
+    console.log(`[SW] Industry data refreshed: ${allCompanies.length} companies in industry ${companyType}`);
+  } catch (err) {
+    console.error('[SW] Industry refresh failed:', err);
+  }
+}
+
 // Listen for messages from popup
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === 'setupAlarms') {
@@ -329,6 +434,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.action === 'refreshData') {
     refreshCompanyData().then(() => sendResponse({ ok: true }));
+    return true;
+  }
+  if (msg.action === 'refreshIndustry') {
+    refreshIndustryData().then(() => sendResponse({ ok: true }));
     return true;
   }
 });

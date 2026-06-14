@@ -2,7 +2,7 @@
 const DB = {
   db: null,
   DB_NAME: 'torn-company-manager',
-  DB_VERSION: 11,
+  DB_VERSION: 12,
 
   async init() {
     return new Promise((resolve, reject) => {
@@ -124,6 +124,15 @@ const DB = {
         if (!db.objectStoreNames.contains('talents')) {
           db.createObjectStore('talents', { keyPath: 'player_id' });
         }
+        // Industry companies (v12)
+        if (!db.objectStoreNames.contains('industry_companies')) {
+          const icStore = db.createObjectStore('industry_companies', { keyPath: 'CompanyID' });
+          icStore.createIndex('industry_id', 'industry_id');
+        }
+        // Industry metadata (v12)
+        if (!db.objectStoreNames.contains('industry_meta')) {
+          db.createObjectStore('industry_meta', { keyPath: 'key' });
+        }
         // Add week_key index to existing transactions store (v3→v4 upgrade)
         if (db.objectStoreNames.contains('transactions')) {
           var txStore = e.target.transaction.objectStore('transactions');
@@ -215,7 +224,7 @@ const DB = {
       'rehab_records', 'rehab_config', 'boost_sellers', 'company_types', 'settings',
       'employees_master', 'tax_weeks', 'tax_carryover', 'employee_tax',
       'employee_tax_rates', 'merit_history', 'train_fund_allocations',
-      'rehab_api_snapshots', 'talents'
+      'rehab_api_snapshots', 'talents', 'industry_companies', 'industry_meta'
     ];
     const data = {};
     for (const store of stores) {
@@ -234,7 +243,7 @@ const DB = {
       'rehab_records', 'rehab_config', 'boost_sellers', 'company_types', 'settings',
       'employees_master', 'tax_weeks', 'tax_carryover', 'employee_tax',
       'employee_tax_rates', 'merit_history', 'train_fund_allocations',
-      'rehab_api_snapshots', 'talents'
+      'rehab_api_snapshots', 'talents', 'industry_companies', 'industry_meta'
     ];
     for (const store of stores) {
       if (data[store] !== undefined) {

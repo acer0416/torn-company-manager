@@ -1023,6 +1023,7 @@ window.EmployeePage = (() => {
     if (col === 'stats') {
       return (t.manual_labor || 0) + (t.intelligence || 0) + (t.endurance || 0);
     }
+    if (col === 'note') return t.note || '';
     if (col.startsWith('job_')) {
       const jobName = col.replace('job_', '');
       const currentCompany = COMPANY_JOBS[_simCompanyTypeId];
@@ -1436,6 +1437,7 @@ window.EmployeePage = (() => {
           <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
             <h3 class="text-base font-bold text-white flex items-center gap-2">
               <i class="fas fa-users-cog text-torn-accent"></i> 人才库
+              <i class="fas fa-exclamation-circle text-gray-500 text-xs cursor-help" title="效率计算默认 settle in=10，addiction=0"></i>
             </h3>
             <div class="flex items-center gap-3">
               <div class="flex items-center gap-2">
@@ -1571,19 +1573,18 @@ window.EmployeePage = (() => {
         const jobs = currentCompany ? currentCompany.jobs : [];
 
         const headers = [
-          { key: 'name', label: _talentSortHeader('姓名', 'name') },
-          { key: 'settle_in', label: _talentSortHeader('Settle In', 'settle_in') },
-          { key: 'merit', label: _talentSortHeader('Merit', 'merit') },
-          { key: 'director_edu', label: _talentSortHeader('Director Edu', 'director_edu') },
-          { key: 'addiction', label: _talentSortHeader('Addiction', 'addiction') },
-          { key: 'stats', label: _talentSortHeader('Working Stats', 'stats') }
+          { key: 'name', label: _talentSortHeader('姓名', 'name'), class: 'text-center' },
+          { key: 'merit', label: _talentSortHeader('Merit', 'merit'), class: 'text-center' },
+          { key: 'director_edu', label: _talentSortHeader('Director Edu', 'director_edu'), class: 'text-center' },
+          { key: 'stats', label: _talentSortHeader('Working Stats', 'stats'), class: 'text-center' }
         ];
 
         jobs.forEach(j => {
-          headers.push({ key: `job_${j.name}`, label: _talentSortHeader(j.name, `job_${j.name}`) });
+          headers.push({ key: `job_${j.name}`, label: _talentSortHeader(j.name, `job_${j.name}`), class: 'text-center' });
         });
 
-        headers.push({ key: 'actions', label: '操作' });
+        headers.push({ key: 'note', label: _talentSortHeader('备注', 'note'), class: 'text-center' });
+        headers.push({ key: 'actions', label: '操作', class: 'text-center' });
 
         const talentRows = talents.map(t => {
           const statsDisplay = `${Utils.formatStatNum(t.manual_labor)} / ${Utils.formatStatNum(t.intelligence)} / ${Utils.formatStatNum(t.endurance)}`;
@@ -1591,11 +1592,10 @@ window.EmployeePage = (() => {
 
           const row = {
             name: `<a href="https://www.torn.com/profiles.php?XID=${t.player_id}" target="_blank" class="text-torn-accent hover:underline">${t.name || 'Unknown'}</a>`,
-            settle_in: `<span class="font-mono">${t.settled_in ?? 10}</span>`,
             merit: `<span class="font-mono">${t.merits ?? 0}</span>`,
             director_edu: `<span class="font-mono">${tEdu}</span>`,
-            addiction: `<span class="font-mono">${t.addiction != null ? t.addiction : '—'}</span>`,
-            stats: `<span class="text-gray-400 font-mono">${statsDisplay}</span>`
+            stats: `<span class="text-gray-400 font-mono">${statsDisplay}</span>`,
+            note: `<span class="text-gray-400 text-xs">${t.note || '—'}</span>`
           };
 
           jobs.forEach(j => {

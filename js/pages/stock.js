@@ -225,7 +225,12 @@ window.StockPage = {
     const sharePct = alloc?.sharePct ?? null;
     let daysLeft = null;
     if (dailyRate && dailyRate > 0) {
-      daysLeft = inStock / dailyRate;
+      const baseDays = inStock / dailyRate;
+      if (baseDays > 1) {
+        daysLeft = (inStock + onOrder) / dailyRate;
+      } else {
+        daysLeft = baseDays;
+      }
     }
     const capDays = Utils.stockCapDays(targetStock, dailyRate);
     const suggestedQty = targetStock != null

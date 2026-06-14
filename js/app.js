@@ -64,6 +64,7 @@
     'finance': typeof FinancePage !== 'undefined' ? FinancePage : null,
     'rehab': typeof RehabPage !== 'undefined' ? RehabPage : null,
     'boost': typeof BoostPage !== 'undefined' ? BoostPage : null,
+    'industry': typeof IndustryPage !== 'undefined' ? IndustryPage : null,
     'settings': typeof SettingsPage !== 'undefined' ? SettingsPage : null,
   };
 

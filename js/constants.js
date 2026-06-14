@@ -15,7 +15,8 @@ const ALL_STORES = [
   'rehab_records', 'rehab_config', 'boost_sellers', 'company_types',
   'settings', 'employees_master', 'tax_weeks', 'tax_carryover',
   'employee_tax', 'employee_tax_rates', 'merit_history',
-  'train_fund_allocations', 'rehab_api_snapshots', 'talents'
+  'train_fund_allocations', 'rehab_api_snapshots', 'talents',
+  'industry_companies', 'industry_meta'
 ];
 
 const TRAIN_CATEGORIES = [

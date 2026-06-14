@@ -67,19 +67,21 @@ window.UI = {
     const headerHtml = headers.map(h => {
       const sortableAttr = isSortable && h.sortable !== false ? 'data-sortable="true"' : '';
       const keyAttr = h.key ? `data-key="${h.key}"` : '';
+      const classAttr = h.class ? `class="${h.class}"` : '';
       const sortIndicator = isSortable && h.sortable !== false
         ? ' <span class="sort-indicator"><i class="fas fa-sort"></i></span>'
         : '';
-      return `<th ${sortableAttr} ${keyAttr} style="${h.width ? 'width:' + h.width : ''}">${h.label || ''}${sortIndicator}</th>`;
+      return `<th ${sortableAttr} ${keyAttr} ${classAttr} style="${h.width ? 'width:' + h.width : ''}">${h.label || ''}${sortIndicator}</th>`;
     }).join('');
 
     const bodyHtml = rows.map(row => {
       const cells = headers.map(h => {
         const rawValue = row[h.key];
+        const cellClass = h.class ? ` class="${h.class}"` : '';
         if (h.render) {
-          return `<td>${h.render(rawValue, row, h.width)}</td>`;
+          return `<td${cellClass}>${h.render(rawValue, row, h.width)}</td>`;
         }
-        return `<td>${rawValue != null ? rawValue : ''}</td>`;
+        return `<td${cellClass}>${rawValue != null ? rawValue : ''}</td>`;
       }).join('');
       return `<tr data-id="${row.id || ''}">${cells}</tr>`;
     }).join('');

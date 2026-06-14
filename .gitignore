@@ -3,7 +3,16 @@ node_modules/
 .idea/
 .vscode/
 *.log
+*.exe
+*.ps1
+*.tsx
 AGENTS.md
 .roo/
-torn V2 api*.md
 plans/
+scratch/
+torn V2 api*.md
+torn-api-developer-guide.md
+companies.md
+debug-training-plan.md
+IndustryViewer.html
+截图/

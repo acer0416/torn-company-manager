@@ -214,6 +214,12 @@ window.DashboardPage = {
       const target = allocations[item.name]?.target || 0;
       const sold = item.sold_amount || 0;
       
+      let daysLeft = null;
+      if (sold > 0) {
+        const baseDays = item.in_stock / sold;
+        daysLeft = baseDays > 1 ? (item.in_stock + item.on_order) / sold : baseDays;
+      }
+
       let isLow = false;
       let reason = '';
       
@@ -228,12 +234,23 @@ window.DashboardPage = {
         reason = `库存极低 (当前 ${item.in_stock}/${target})`;
       } else if (sold > 0 && total < sold * 2) {
         isLow = true;
-        reason = `预计 ${(total / sold).toFixed(1)} 天售罄 (日均销量 ${sold})`;
+        reason = `预计 ${daysLeft.toFixed(1)} 天售罄 (日均销量 ${sold})`;
       }
       
       if (isLow) {
-        lowStockItems.push({ name: item.name, in_stock: item.in_stock, on_order: item.on_order, target, reason });
+        lowStockItems.push({ name: item.name, in_stock: item.in_stock, on_order: item.on_order, target, reason, daysLeft });
       }
+    });
+
+    const allStocksWithDays = normalizedStocks.map(item => {
+      const target = allocations[item.name]?.target || 0;
+      const sold = item.sold_amount || 0;
+      let daysLeft = null;
+      if (sold > 0) {
+        const baseDays = item.in_stock / sold;
+        daysLeft = baseDays > 1 ? (item.in_stock + item.on_order) / sold : baseDays;
+      }
+      return { name: item.name, in_stock: item.in_stock, on_order: item.on_order, target, sold, daysLeft };
     });
 
     // 3. 员工缴税情况
@@ -387,26 +404,39 @@ window.DashboardPage = {
           <div class="bg-torn-surface p-4 rounded-lg border border-torn-border flex flex-col justify-between" style="min-height: 160px;">
             <div class="flex items-center gap-2 mb-2 text-torn-gold">
               <i class="fas fa-boxes text-lg"></i>
-              <h4 class="font-bold text-sm text-white">低库存预警</h4>
+              <h4 class="font-bold text-sm text-white">库存预警</h4>
             </div>
             <div class="my-2 flex-grow overflow-y-auto max-h-32 pr-1" style="min-height: 60px;">
               ${lowStockItems.length > 0 
                 ? `<div class="space-y-1.5">
-                     ${lowStockItems.map(item => `
-                       <div class="flex justify-between items-center bg-torn-dark p-1.5 rounded border border-torn-border">
-                         <div style="max-width: 65%;">
-                           <div class="text-white font-medium text-xs truncate" title="${item.name}">${item.name}</div>
-                           <div class="text-red-400 text-xxs truncate" title="${item.reason}">${item.reason}</div>
-                         </div>
-                         <div class="text-right">
-                           <span class="text-red-400 font-bold text-xs">${item.in_stock.toLocaleString()}</span>
-                           <span class="text-gray-500 text-xxs">/ ${item.target.toLocaleString()}</span>
-                         </div>
-                       </div>
-                     `).join('')}
+                      ${lowStockItems.map(item => `
+                        <div class="flex justify-between items-center bg-torn-dark p-1.5 rounded border border-torn-border">
+                          <div style="max-width: 55%;">
+                            <div class="text-white font-medium text-xs truncate" title="${item.name}">${item.name}</div>
+                            <div class="text-red-400 text-xxs truncate" title="${item.reason}">${item.reason}</div>
+                          </div>
+                          <div class="text-right" style="min-width: 45%;">
+                            <div class="flex items-center justify-end gap-2">
+                              <span class="text-red-400 font-bold text-xs">${item.in_stock.toLocaleString()}</span>
+                              <span class="text-gray-500 text-xxs">/ ${item.target.toLocaleString()}</span>
+                            </div>
+                            ${item.daysLeft != null ? `<div class="text-xxs ${item.daysLeft < 1 ? 'text-red-400' : 'text-yellow-400'}">${item.daysLeft.toFixed(1)} 天</div>` : ''}
+                          </div>
+                        </div>
+                      `).join('')}
                    </div>`
-                : `<div class="text-green-400 flex items-center gap-2 text-xs py-4">
-                     <i class="fas fa-check-circle"></i> 所有商品库存充足
+                : `<div class="space-y-1.5">
+                      ${allStocksWithDays.map(item => `
+                        <div class="flex justify-between items-center bg-torn-dark p-1.5 rounded border border-torn-border">
+                          <div class="text-white font-medium text-xs truncate" title="${item.name}">${item.name}</div>
+                          <div class="text-right">
+                            ${item.daysLeft != null 
+                              ? `<span style="font-size: 10px; color: ${item.daysLeft < 1 ? '#f87171' : item.daysLeft < 3 ? '#facc15' : '#4ade80'}">${item.daysLeft.toFixed(1)} 天</span>`
+                              : `<span style="font-size: 10px; color: #6b7280">—</span>`
+                            }
+                          </div>
+                        </div>
+                      `).join('')}
                    </div>`
               }
             </div>
